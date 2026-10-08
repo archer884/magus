@@ -5,7 +5,9 @@ pub mod card;
 pub mod cards;
 pub mod game;
 pub mod mana;
+pub mod pool;
 pub mod view;
 
 pub use game::{Action, ActionError, Attack, Block, Game, ObjectId, PlayerId, Step, Target};
+pub use pool::{CardPool, Pack, PackError};
 pub use view::{GameView, Prompt};

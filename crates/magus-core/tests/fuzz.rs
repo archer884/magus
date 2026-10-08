@@ -1,9 +1,8 @@
 //! Plays many games of random legal moves, using only what each player's view
 //! offers, and checks that every game finishes and no card is ever lost.
 
-use magus_core::cards::DECKS;
 use magus_core::view::Prompt;
-use magus_core::{Action, Attack, Block, Game, GameView};
+use magus_core::{Action, Attack, Block, CardPool, Game, GameView, Pack};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -83,15 +82,27 @@ fn card_count(view: &GameView, p: usize) -> usize {
             .count()
 }
 
+/// The built-in pool plus the sample pack, so cards from outside the engine get
+/// the same random play as built-in ones.
+fn pool() -> CardPool {
+    let pack: Pack = toml::from_str(include_str!("fixtures/sample-pack.toml")).unwrap();
+    let mut pool = CardPool::builtin();
+    pool.add_pack(pack).unwrap();
+    pool
+}
+
 #[test]
 fn random_games_finish_and_conserve_cards() {
+    let pool = pool();
+    let decks = pool.decks();
+    assert!(decks.iter().any(|d| d.key == "harbor-tides"));
     let mut finished = 0;
     for seed in 0..300u64 {
         let mut rng = StdRng::seed_from_u64(seed);
-        let a = &DECKS[seed as usize % DECKS.len()];
-        let b = &DECKS[(seed as usize / DECKS.len()) % DECKS.len()];
+        let a = decks[seed as usize % decks.len()];
+        let b = decks[(seed as usize / decks.len()) % decks.len()];
         let seats = [("A".to_string(), a), ("B".to_string(), b)];
-        let mut game = Game::new(&seats, seed);
+        let mut game = Game::new(&pool, &seats, seed);
         for _ in 0..20_000 {
             let Some(p) = game.waiting_on() else { break };
             let view = game.view(p);

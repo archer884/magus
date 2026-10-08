@@ -1,0 +1,65 @@
+# A small card pack that uses only mechanics the engine already has. Tests load
+# it to check that cards defined outside the engine behave like built-in ones.
+
+[[card]]
+key = "gullwing-courier"
+name = "Gullwing Courier"
+type = "creature"
+cost = "2U"
+subtype = "Bird"
+power = 1
+toughness = 2
+keywords = ["flying"]
+
+[[card.ability]]
+type = "triggered"
+when = "enters"
+effects = [{ type = "draw", who = "you", count = 1 }]
+
+[[card]]
+key = "harbor-toll"
+name = "Harbor Toll"
+type = "creature"
+cost = "3B"
+subtype = "Spirit"
+power = 2
+toughness = 3
+
+# Two separate triggers: these resolve in the order written.
+[[card.ability]]
+type = "triggered"
+when = "enters"
+effects = [{ type = "lose_life", who = "each_opponent", amount = 2 }]
+
+[[card.ability]]
+type = "triggered"
+when = "enters"
+effects = [{ type = "gain_life", who = "you", amount = 2 }]
+
+[[card]]
+key = "riptide-lash"
+name = "Riptide Lash"
+type = "instant"
+cost = "1UB"
+effects = [
+    { type = "damage", amount = 2, target = "creature" },
+    { type = "draw", who = "you", count = 1 },
+]
+
+[[deck]]
+key = "harbor-tides"
+name = "Harbor Tides"
+description = "Blue/black fliers and drain, from the sample pack."
+
+[deck.cards]
+gullwing-courier = 4
+harbor-toll = 4
+riptide-lash = 4
+skyward-kestrel = 4
+mistwing-drake = 4
+fen-stalker = 4
+wailing-shade = 4
+cove-scholar = 4
+night-leech = 4
+lagoon = 12
+bog = 12

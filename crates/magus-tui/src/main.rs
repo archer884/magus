@@ -1,12 +1,14 @@
 mod app;
 mod ui;
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
-use magus_core::cards::{self, DECKS};
+use magus_core::CardPool;
 use magus_protocol::{ClientMsg, DEFAULT_PORT, PROTOCOL_VERSION};
 use rand::seq::SliceRandom;
 use tokio::net::TcpListener;
@@ -38,26 +40,32 @@ struct Args {
     /// Pause before each bot move in solo mode, in milliseconds.
     #[arg(long, default_value_t = 600, requires = "solo")]
     bot_delay_ms: u64,
+    /// In solo mode, a card pack (TOML) to add to the built-in cards and
+    /// decks. Repeat to load several.
+    #[arg(long = "cards", value_name = "PATH", requires = "solo")]
+    packs: Vec<PathBuf>,
 }
 
 /// Starts a server on a random local port with a bot waiting in `room`, and
 /// returns the server's address.
 async fn start_solo(
+    pool: CardPool,
     room: &str,
     bot_deck: Option<String>,
     delay: Duration,
 ) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
-    tokio::spawn(magus_server::serve(listener));
     let deck = match bot_deck {
         Some(deck) => deck,
-        None => DECKS
+        None => pool
+            .decks()
             .choose(&mut rand::thread_rng())
             .expect("there are decks")
             .key
             .to_string(),
     };
+    tokio::spawn(magus_server::serve(listener, Arc::new(pool)));
     let (bot_addr, room) = (addr.clone(), room.to_string());
     tokio::spawn(async move { magus_bot::run(&bot_addr, "Bot", &room, &deck, delay).await });
     Ok(addr)
@@ -67,16 +75,13 @@ async fn start_solo(
 async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     if args.solo {
-        if let Some(deck) = args
-            .bot_deck
-            .as_deref()
-            .filter(|d| cards::deck(d).is_none())
-        {
+        let pool = magus_server::load_pool(&args.packs)?;
+        if let Some(deck) = args.bot_deck.as_deref().filter(|d| pool.deck(d).is_none()) {
             anyhow::bail!("unknown bot deck {deck:?}");
         }
         args.room = "solo".into();
         let delay = Duration::from_millis(args.bot_delay_ms);
-        args.server = start_solo(&args.room, args.bot_deck.take(), delay).await?;
+        args.server = start_solo(pool, &args.room, args.bot_deck.take(), delay).await?;
     }
     let (tx, mut rx) = magus_protocol::connect(&args.server)
         .await
@@ -116,8 +121,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use magus_core::Game;
-    use magus_core::cards::DECKS;
+    use magus_core::{CardPool, Game};
     use magus_protocol::{ClientMsg, ServerMsg};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -144,9 +148,14 @@ mod tests {
 
     #[tokio::test]
     async fn solo_mode_starts_a_game_against_the_bot() {
-        let addr = crate::start_solo("solo", Some("tide-ash".into()), std::time::Duration::ZERO)
-            .await
-            .unwrap();
+        let addr = crate::start_solo(
+            CardPool::builtin(),
+            "solo",
+            Some("tide-ash".into()),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
         let (tx, mut rx) = magus_protocol::connect(&addr).await.unwrap();
         tx.send(ClientMsg::Hello {
             name: "Me".into(),
@@ -175,11 +184,12 @@ mod tests {
 
     #[test]
     fn renders_a_game_and_plays_a_land() {
+        let pool = CardPool::builtin();
         let seats = [
-            ("Ann".to_string(), &DECKS[0]),
-            ("Bob".to_string(), &DECKS[1]),
+            ("Ann".to_string(), pool.decks()[0]),
+            ("Bob".to_string(), pool.decks()[1]),
         ];
-        let mut game = Game::new(&seats, 3);
+        let mut game = Game::new(&pool, &seats, 3);
         let me = game.waiting_on().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(tx, "practice".into(), Some("ember-thorn".into()));

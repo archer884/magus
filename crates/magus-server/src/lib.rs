@@ -2,12 +2,13 @@
 //! game starts, owned by its own task, which is the single source of truth.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
 use futures::{SinkExt, StreamExt};
-use magus_core::cards::{self, DeckList};
-use magus_core::{Action, Game, PlayerId};
+use magus_core::cards::DeckList;
+use magus_core::{Action, CardPool, Game, Pack, PlayerId};
 use magus_protocol::{
     ClientMsg, LineReader, PROTOCOL_VERSION, ServerMsg, deck_infos, decode, encode,
 };
@@ -39,13 +40,34 @@ enum GameInput {
 
 type Lobby = Arc<Mutex<HashMap<String, WaitingSeat>>>;
 
-pub async fn serve(listener: TcpListener) -> std::io::Result<()> {
+/// Reads a card pack from a TOML file. Validation happens when it's added to a
+/// [`CardPool`].
+pub fn load_pack(path: &Path) -> anyhow::Result<Pack> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The built-in cards plus each pack in `paths`, in order.
+pub fn load_pool(paths: &[impl AsRef<Path>]) -> anyhow::Result<CardPool> {
+    let mut pool = CardPool::builtin();
+    for path in paths {
+        let path = path.as_ref();
+        pool.add_pack(load_pack(path)?)
+            .with_context(|| format!("{} has problems", path.display()))?;
+        tracing::info!(pack = %path.display(), "loaded card pack");
+    }
+    Ok(pool)
+}
+
+/// Accepts players and runs their games, offering the decks in `pool`.
+pub async fn serve(listener: TcpListener, pool: Arc<CardPool>) -> std::io::Result<()> {
     let lobby: Lobby = Arc::default();
     loop {
         let (stream, addr) = listener.accept().await?;
-        let lobby = lobby.clone();
+        let (lobby, pool) = (lobby.clone(), pool.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, lobby).await {
+            if let Err(e) = handle_connection(stream, lobby, pool).await {
                 tracing::warn!(%addr, "connection error: {e:#}");
             }
         });
@@ -61,7 +83,11 @@ async fn next_msg(reader: &mut LineReader) -> anyhow::Result<Option<ClientMsg>> 
     }
 }
 
-async fn handle_connection(stream: TcpStream, lobby: Lobby) -> anyhow::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    lobby: Lobby,
+    pool: Arc<CardPool>,
+) -> anyhow::Result<()> {
     let (mut reader, mut writer) = magus_protocol::split(stream);
     let (out, mut out_rx) = mpsc::unbounded_channel::<ServerMsg>();
     tokio::spawn(async move {
@@ -96,12 +122,12 @@ async fn handle_connection(stream: TcpStream, lobby: Lobby) -> anyhow::Result<()
         None => return Ok(()),
     };
     let _ = out.send(ServerMsg::Welcome {
-        decks: deck_infos(),
+        decks: deck_infos(&pool),
     });
 
     let (room, deck) = loop {
         match next_msg(&mut reader).await? {
-            Some(ClientMsg::Join { room, deck }) => match cards::deck(&deck) {
+            Some(ClientMsg::Join { room, deck }) => match pool.deck(&deck) {
                 Some(deck) => break (room.trim().to_lowercase(), deck),
                 None => {
                     let _ = out.send(ServerMsg::Error {
@@ -129,7 +155,7 @@ async fn handle_connection(stream: TcpStream, lobby: Lobby) -> anyhow::Result<()
         match rooms.remove(&room) {
             Some(waiting) if !waiting.notify.is_closed() => {
                 let (game_tx, game_rx) = mpsc::unbounded_channel();
-                tokio::spawn(run_game(vec![waiting.seat, me], game_rx));
+                tokio::spawn(run_game(pool, vec![waiting.seat, me], game_rx));
                 if waiting
                     .notify
                     .send(Assignment {
@@ -215,11 +241,15 @@ async fn handle_connection(stream: TcpStream, lobby: Lobby) -> anyhow::Result<()
     Ok(())
 }
 
-async fn run_game(seats: Vec<Seat>, mut inputs: mpsc::UnboundedReceiver<(PlayerId, GameInput)>) {
+async fn run_game(
+    pool: Arc<CardPool>,
+    seats: Vec<Seat>,
+    mut inputs: mpsc::UnboundedReceiver<(PlayerId, GameInput)>,
+) {
     let names: Vec<String> = seats.iter().map(|s| s.name.clone()).collect();
     let players: Vec<(String, &'static DeckList)> =
         seats.iter().map(|s| (s.name.clone(), s.deck)).collect();
-    let mut game = Game::new(&players, rand::random());
+    let mut game = Game::new(&pool, &players, rand::random());
     tracing::info!(players = %names.join(" vs "), "game started");
 
     let send_state = |game: &Game, p: PlayerId| {
@@ -263,4 +293,70 @@ async fn run_game(seats: Vec<Seat>, mut inputs: mpsc::UnboundedReceiver<(PlayerI
         }
     }
     tracing::info!(players = %names.join(" vs "), "game finished");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../magus-core/tests/fixtures/sample-pack.toml"
+    );
+
+    #[test]
+    fn loads_the_sample_pack() {
+        let pool = load_pool(&[SAMPLE]).unwrap();
+        assert!(pool.card("gullwing-courier").is_some());
+        assert_eq!(
+            deck_infos(&pool).last().unwrap().key,
+            "harbor-tides",
+            "pack decks are offered to players"
+        );
+    }
+
+    #[test]
+    fn typos_are_reported_not_ignored() {
+        let text = std::fs::read_to_string(SAMPLE)
+            .unwrap()
+            .replace("count = 1 }]", "cuont = 1 }]");
+        let err = toml::from_str::<Pack>(&text).unwrap_err().to_string();
+        assert!(err.contains("cuont"), "{err}");
+    }
+
+    #[test]
+    fn invalid_packs_name_the_file_and_every_problem() {
+        let dir = std::env::temp_dir().join(format!("magus-pack-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[card]]
+            key = "lagoon"
+            name = "Another Lagoon"
+            type = "land"
+            mana = "U"
+
+            [[card]]
+            key = "glass-golem"
+            name = "Glass Golem"
+            type = "creature"
+            cost = "3"
+            power = 2
+            "#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load_pool(&[&path]).unwrap_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(err.contains("bad.toml has problems"), "{err}");
+        assert!(
+            err.contains(r#"card "lagoon": that key is already taken"#),
+            "{err}"
+        );
+        assert!(
+            err.contains(r#"card "glass-golem": a creature needs both power and toughness"#),
+            "{err}"
+        );
+    }
 }

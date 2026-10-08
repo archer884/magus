@@ -6,7 +6,7 @@
 //! answers with `act` whenever its prompt asks for a decision.
 
 use futures::{SinkExt, StreamExt};
-use magus_core::cards::DECKS;
+use magus_core::CardPool;
 use magus_core::{Action, GameView, PlayerId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -66,8 +66,9 @@ pub struct DeckInfo {
     pub description: String,
 }
 
-pub fn deck_infos() -> Vec<DeckInfo> {
-    DECKS
+/// The decks a server offers, for its welcome message.
+pub fn deck_infos(pool: &CardPool) -> Vec<DeckInfo> {
+    pool.decks()
         .iter()
         .map(|d| DeckInfo {
             key: d.key.into(),
@@ -157,8 +158,12 @@ mod tests {
         );
         assert_eq!(decode::<ClientMsg>(&line).unwrap(), msg);
 
-        let seats = [("A".to_string(), &DECKS[0]), ("B".to_string(), &DECKS[1])];
-        let view = Game::new(&seats, 1).view(0);
+        let pool = CardPool::builtin();
+        let seats = [
+            ("A".to_string(), pool.decks()[0]),
+            ("B".to_string(), pool.decks()[1]),
+        ];
+        let view = Game::new(&pool, &seats, 1).view(0);
         let msg = ServerMsg::State {
             view: Box::new(view),
         };

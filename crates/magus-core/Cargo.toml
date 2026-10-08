@@ -6,3 +6,7 @@ edition.workspace = true
 [dependencies]
 rand.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+toml.workspace = true

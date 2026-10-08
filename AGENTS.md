@@ -30,8 +30,12 @@ Key files in core:
 - `view.rs`: everything clients see, including `Prompt`, the list of legal
   choices.
 - `cards.rs`: the card pool (`static CARDS`) and decklists (`static DECKS`).
-- `card.rs`: `CardDef`, `Effect`, `Keyword`, rules-text generation.
+- `card.rs`: `CardDef`, `Effect`, `Ability`/`Trigger`, `Who`, `Keyword`,
+  rules-text generation.
 - `mana.rs`: costs, plus `plan_payment` (auto-tap).
+- `pool.rs`: `CardPool` (built-in cards plus card packs) and the `Pack` data
+  types packs are parsed into. `Game::new` takes a pool. Parsing TOML lives in
+  `magus-server` (`load_pack`/`load_pool`), not in core.
 
 ## Core design rules (don't break these)
 
@@ -56,9 +60,21 @@ Key files in core:
 5. **Versioning.** `Game::version` increments per accepted action; clients
    quote it in `ClientMsg::Act`, and the server rejects stale ones. Bump
    `PROTOCOL_VERSION` for any wire-incompatible change.
-6. **Card invariants** (tested in `cards.rs`): at most one targeted effect per
-   spell; creature (enters-the-battlefield) effects never target; all decks are
-   60 cards of known keys.
+6. **Card invariants** live in `CardDef::problems` and `CardPool::problems`,
+   and apply equally to built-in cards and packs: at most one targeted effect
+   per spell; spells use `effects` and permanents use `abilities`, never the
+   other way round; triggered abilities never target; all decks are 60 cards
+   of known keys. Add new rules there, not in tests, so packs get them too.
+   Pack data is untrusted: never `panic!` on it (e.g. use
+   `ManaCost::try_parse`), and keep `deny_unknown_fields` so typos are errors.
+7. **Card behavior is composed, not named.** Rules-changing mechanics (flying,
+   trample…) are `Keyword`s, checked where the rule applies. Everything of the
+   form "when X, do Y" is a `Trigger` plus `Effect`s, and effects take a `Who`
+   rather than baking in the player they affect. Add a new mechanic as a
+   reusable building block, never as code for one specific card: cards will
+   be loaded from card packs and edited in a card builder. A new variant
+   changes the pack format: document it in README's "Card packs" section. The
+   serialized shape is pinned by tests in `card.rs`.
 
 ## Engine notes
 
@@ -68,7 +84,11 @@ Key files in core:
   see TODO). `move_to` resets per-battlefield state and removes the object from
   combat.
 - Stack items: spells use the card's id; triggered abilities get a fresh id
-  that is *not* in `objects`. Use `item.source` for the card.
+  that is *not* in `objects`. Use `item.source` for the card, and
+  `StackKind::Ability(i)` for which of its `abilities` is resolving.
+- `Game::trigger(source, event)` puts a permanent's matching abilities on the
+  stack, in reverse so they resolve in printed order. Only `Trigger::Enters`
+  is fired so far (from `resolve`).
 - Combat damage is computed first, then applied, so it's simultaneous.
   Attackers assign damage to blockers in block order.
 - Mana is paid automatically; basic lands only, so greedy payment is exact.
@@ -95,7 +115,7 @@ Key files in core:
 cargo test --workspace                       # all tests (~2s)
 cargo clippy --workspace --all-targets       # keep at zero warnings
 cargo fmt --all                              # rustfmt defaults
-cargo run -p magus-server -- --bind 127.0.0.1:7878
+cargo run -p magus-server -- --bind 127.0.0.1:7878 [--cards pack.toml]
 cargo run -p magus-bot -- --room practice --delay-ms 0
 cargo run -p magus-tui -- --room practice    # needs a real terminal
 cargo run -p magus-tui -- --solo             # one-command game vs. the bot
@@ -105,7 +125,9 @@ Testing layers:
 - `magus-core` unit tests in `game.rs` use `blank_game()` + `put()` to set up
   exact board states. Prefer this for new rules.
 - `magus-core/tests/fuzz.rs` plays 300 random games using only the prompts and
-  checks card conservation. Run it after any engine change.
+  checks card conservation, across the built-in decks plus the deck in
+  `tests/fixtures/sample-pack.toml`. Run it after any engine change. Add new
+  mechanics to that pack so the fuzzer exercises them.
 - `magus-bot/tests/e2e.rs` runs a real server plus two bots over TCP.
 - `magus-tui` renders into `TestBackend` (see `main.rs` tests). Use it to check
   layout without a terminal; no tmux is available on the dev machine.

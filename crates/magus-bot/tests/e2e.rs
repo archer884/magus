@@ -1,15 +1,17 @@
 //! Starts a real server and has two bots play complete games over TCP.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use magus_bot::Outcome;
+use magus_core::CardPool;
 use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn two_bots_play_complete_games() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    tokio::spawn(magus_server::serve(listener));
+    tokio::spawn(magus_server::serve(listener, Arc::new(CardPool::builtin())));
 
     let matchups = [
         ("ember-thorn", "tide-ash"),

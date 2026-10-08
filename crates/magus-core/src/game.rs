@@ -10,9 +10,10 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::card::{CardDef, CardKind, Effect, Keyword, TargetKind};
-use crate::cards::{self, DeckList};
+use crate::card::{Ability, CardDef, CardKind, Effect, Keyword, TargetKind, Trigger, Who};
+use crate::cards::DeckList;
 use crate::mana::{Color, plan_payment};
+use crate::pool::CardPool;
 use crate::view::{
     AttackOption, BlockOption, CardView, GameView, PermanentView, PlayKind, PlayOption, PlayerView,
     Prompt, StackItemView,
@@ -186,8 +187,21 @@ struct StackItem {
     id: ObjectId,
     source: ObjectId,
     controller: PlayerId,
-    is_spell: bool,
+    kind: StackKind,
     target: Option<Target>,
+}
+
+impl StackItem {
+    fn is_spell(&self) -> bool {
+        self.kind == StackKind::Spell
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackKind {
+    Spell,
+    /// A triggered ability: an index into the source card's `abilities`.
+    Ability(usize),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,9 +244,9 @@ pub struct Game {
 }
 
 impl Game {
-    /// Starts a game. Each seat is a player name and a deck; the first player
-    /// is chosen at random and skips their first draw.
-    pub fn new(seats: &[(String, &'static DeckList)], seed: u64) -> Game {
+    /// Starts a game. Each seat is a player name and a deck whose cards are in
+    /// `pool`; the first player is chosen at random and skips their first draw.
+    pub fn new(pool: &CardPool, seats: &[(String, &DeckList)], seed: u64) -> Game {
         assert!(seats.len() >= 2, "a game needs at least two players");
         let mut game = Game {
             players: Vec::new(),
@@ -256,7 +270,9 @@ impl Game {
                 .cards
                 .iter()
                 .flat_map(|&(key, n)| {
-                    let def = cards::card(key).unwrap_or_else(|| panic!("unknown card {key}"));
+                    let def = pool
+                        .card(key)
+                        .unwrap_or_else(|| panic!("unknown card {key}"));
                     std::iter::repeat_n(def, n as usize)
                 })
                 .collect();
@@ -405,7 +421,7 @@ impl Game {
                     id: item.id,
                     card: self.card_view(item.source),
                     controller: item.controller,
-                    is_spell: item.is_spell,
+                    is_spell: item.is_spell(),
                     target: item.target,
                 })
                 .collect(),
@@ -877,7 +893,7 @@ impl Game {
             targets.extend(
                 self.stack
                     .iter()
-                    .filter(|s| s.is_spell)
+                    .filter(|s| s.is_spell())
                     .map(|s| Target::Spell(s.id)),
             );
         }
@@ -937,7 +953,7 @@ impl Game {
             id: card,
             source: card,
             controller: p,
-            is_spell: true,
+            kind: StackKind::Spell,
             target,
         });
         let aim = target
@@ -955,39 +971,56 @@ impl Game {
             && !self.valid_targets(kind).contains(&target)
         {
             self.log(format!("{} fizzles: its target is gone.", def.name));
-            if item.is_spell {
+            if item.is_spell() {
                 self.move_to(item.id, Zone::Graveyard);
             }
             return;
         }
-        if item.is_spell && def.is_creature() {
+        if item.is_spell() && def.is_creature() {
             self.move_to(item.id, Zone::Battlefield);
             self.objects
                 .get_mut(&item.id)
                 .expect("object exists")
                 .controller = item.controller;
             self.log(format!("{} enters the battlefield.", def.name));
-            if !def.effects.is_empty() {
-                let id = self.fresh_id();
-                self.stack.push(StackItem {
-                    id,
-                    source: item.id,
-                    controller: item.controller,
-                    is_spell: false,
-                    target: None,
-                });
-                self.log(format!("{}'s ability triggers.", def.name));
-            }
+            self.trigger(item.id, Trigger::Enters);
             return;
         }
-        if !item.is_spell {
-            self.log(format!("{}'s ability resolves.", def.name));
-        }
-        for effect in def.effects {
+        let effects = match item.kind {
+            StackKind::Spell => def.effects,
+            StackKind::Ability(i) => {
+                self.log(format!("{}'s ability resolves.", def.name));
+                let Ability::Triggered { effects, .. } = def.abilities[i];
+                effects
+            }
+        };
+        for effect in effects {
             self.apply_effect(*effect, item.source, item.controller, item.target);
         }
-        if item.is_spell {
+        if item.is_spell() {
             self.move_to(item.id, Zone::Graveyard);
+        }
+    }
+
+    /// Puts each of `source`'s abilities that trigger on `event` onto the stack.
+    fn trigger(&mut self, source: ObjectId, event: Trigger) {
+        let o = &self.objects[&source];
+        let (def, controller) = (o.def, o.controller);
+        // Pushed in reverse so that they resolve in the order printed on the card.
+        for (i, ability) in def.abilities.iter().enumerate().rev() {
+            let Ability::Triggered { when, .. } = ability;
+            if *when != event {
+                continue;
+            }
+            let id = self.fresh_id();
+            self.stack.push(StackItem {
+                id,
+                source,
+                controller,
+                kind: StackKind::Ability(i),
+                target: None,
+            });
+            self.log(format!("{}'s ability triggers.", def.name));
         }
     }
 
@@ -998,7 +1031,6 @@ impl Game {
         controller: PlayerId,
         target: Option<Target>,
     ) {
-        let you = self.name(controller).to_string();
         match effect {
             Effect::Damage { amount, .. } => {
                 if let Some(t) = target {
@@ -1039,31 +1071,44 @@ impl Game {
                     self.move_to(id, Zone::Graveyard);
                 }
             }
-            Effect::Draw(n) => {
-                for _ in 0..n {
-                    self.draw(controller);
-                }
-                let cards = if n == 1 {
-                    "a card".to_string()
-                } else {
-                    format!("{n} cards")
-                };
-                self.log(format!("{you} draws {cards}."));
-            }
-            Effect::GainLife(n) => {
-                self.players[controller].life += n;
-                self.log(format!("{you} gains {n} life."));
-            }
-            Effect::LoseLife(n) => {
-                self.players[controller].life -= n;
-                self.log(format!("{you} loses {n} life."));
-            }
-            Effect::DamageEachOpponent(n) => {
-                let opponents: Vec<_> = self.living().filter(|&q| q != controller).collect();
-                for q in opponents {
-                    self.deal_damage(source, Target::Player(q), n);
+            Effect::Draw { who, count } => {
+                for q in self.players_for(who, controller) {
+                    for _ in 0..count {
+                        self.draw(q);
+                    }
+                    let cards = if count == 1 {
+                        "a card".to_string()
+                    } else {
+                        format!("{count} cards")
+                    };
+                    self.log(format!("{} draws {cards}.", self.name(q)));
                 }
             }
+            Effect::GainLife { who, amount } => {
+                for q in self.players_for(who, controller) {
+                    self.players[q].life += amount;
+                    self.log(format!("{} gains {amount} life.", self.name(q)));
+                }
+            }
+            Effect::LoseLife { who, amount } => {
+                for q in self.players_for(who, controller) {
+                    self.players[q].life -= amount;
+                    self.log(format!("{} loses {amount} life.", self.name(q)));
+                }
+            }
+            Effect::DamagePlayers { who, amount } => {
+                for q in self.players_for(who, controller) {
+                    self.deal_damage(source, Target::Player(q), amount);
+                }
+            }
+        }
+    }
+
+    /// The players `who` refers to, for an effect controlled by `controller`.
+    fn players_for(&self, who: Who, controller: PlayerId) -> Vec<PlayerId> {
+        match who {
+            Who::You => vec![controller],
+            Who::EachOpponent => self.living().filter(|&q| q != controller).collect(),
         }
     }
 
@@ -1326,7 +1371,7 @@ mod tests {
             ("Ann".to_string(), &DECKS[0]),
             ("Bob".to_string(), &DECKS[1]),
         ];
-        let mut game = Game::new(&seats, 7);
+        let mut game = Game::new(&CardPool::builtin(), &seats, 7);
         for p in 0..2 {
             for id in std::mem::take(&mut game.players[p].hand) {
                 game.objects.get_mut(&id).unwrap().zone = Zone::Library;
@@ -1350,7 +1395,7 @@ mod tests {
     }
 
     fn put(game: &mut Game, p: PlayerId, key: &str, zone: Zone) -> ObjectId {
-        let id = game.create(cards::card(key).unwrap(), p, zone);
+        let id = game.create(crate::cards::card(key).unwrap(), p, zone);
         match zone {
             Zone::Battlefield => game.battlefield.push(id),
             Zone::Hand => game.players[p].hand.push(id),
@@ -1552,6 +1597,49 @@ mod tests {
         let options = g.attack_options();
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].attacker, hound);
+    }
+
+    #[test]
+    fn enter_triggers_resolve_in_printed_order() {
+        static TWO_TRIGGERS: CardDef = CardDef {
+            key: "test-two-triggers",
+            name: "Two Triggers",
+            cost: "W",
+            kind: CardKind::Creature {
+                power: 1,
+                toughness: 1,
+            },
+            subtype: "",
+            keywords: &[],
+            effects: &[],
+            abilities: &[
+                Ability::Triggered {
+                    when: Trigger::Enters,
+                    effects: &[Effect::GainLife {
+                        who: Who::You,
+                        amount: 3,
+                    }],
+                },
+                Ability::Triggered {
+                    when: Trigger::Enters,
+                    effects: &[Effect::LoseLife {
+                        who: Who::EachOpponent,
+                        amount: 1,
+                    }],
+                },
+            ],
+        };
+        let mut g = blank_game();
+        lands(&mut g, 0, "meadow", 1);
+        let card = g.create(&TWO_TRIGGERS, 0, Zone::Hand);
+        g.players[0].hand.push(card);
+        g.apply(0, Action::Cast { card, target: None }).unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&card].zone, Zone::Battlefield);
+        assert_eq!(g.players[0].life, 23);
+        assert_eq!(g.players[1].life, 19);
+        let line = |text: &str| g.log.iter().position(|l| l == text).unwrap();
+        assert!(line("Ann gains 3 life.") < line("Bob loses 1 life."));
     }
 
     #[test]

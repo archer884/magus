@@ -48,6 +48,68 @@ or to point a bot at a remote server:
 The server speaks plain TCP. To play over the internet, forward the port or
 run the server on a reachable host. There's no TLS or authentication yet.
 
+## Card packs
+
+A server can offer your own cards and decks alongside the built-in ones. Write
+them in a TOML file and pass it with `--cards` (repeat it for several packs):
+
+```sh
+./target/release/magus-server --cards my-pack.toml
+./target/release/magus --solo --cards my-pack.toml   # solo mode too
+```
+
+Pack decks appear in the deck list when players join. A pack looks like this
+(a full example is `crates/magus-core/tests/fixtures/sample-pack.toml`):
+
+```toml
+[[card]]
+key = "gullwing-courier"        # unique; decks refer to cards by key
+name = "Gullwing Courier"
+type = "creature"               # creature, instant, sorcery or land
+cost = "2U"                     # generic first, then W U B R G
+subtype = "Bird"
+power = 1
+toughness = 2
+keywords = ["flying"]
+
+# Creatures do things through abilities. "enters" means "when this creature
+# enters the battlefield". Add more [[card.ability]] blocks for more abilities.
+[[card.ability]]
+type = "triggered"
+when = "enters"
+effects = [{ type = "draw", who = "you", count = 1 }]
+
+[[card]]
+key = "riptide-lash"
+name = "Riptide Lash"
+type = "instant"
+cost = "1UB"
+effects = [
+    { type = "damage", amount = 2, target = "creature" },
+    { type = "draw", who = "you", count = 1 },
+]
+
+[[deck]]
+key = "harbor-tides"
+name = "Harbor Tides"
+description = "Shown in the deck list."
+
+[deck.cards]                    # card key = copies; exactly 60 in total
+gullwing-courier = 4
+# ...
+```
+
+Effects: `damage` (`amount`, `target`: `any`, `creature`, `player` or
+`spell`), `destroy`, `bounce`, `pump` (`power`, `toughness`), `counter`,
+`draw` (`who`, `count`), `gain_life` / `lose_life` / `damage_players` (`who`,
+`amount`). `who` is `you` or `each_opponent`. A spell has at most one effect
+that targets, and abilities can't target yet. Lands take `mana = "R"` (one
+symbol) and nothing else.
+
+The server checks a pack when it starts and refuses to run if anything is
+wrong, listing every problem: a typo'd field, a key that's already taken, a
+creature missing its toughness, a deck that isn't 60 cards, and so on.
+
 ### Keys
 
 | Key | |
@@ -108,7 +170,8 @@ See `crates/magus-protocol/src/lib.rs` and `crates/magus-core/src/view.rs`.
 - Full priority and stack: instants at any time, responses to spells, counterspells, and spells that fizzle when their target is gone
 - Combat: multiple blockers per attacker, damage assigned in block order
 - Keywords: flying, reach, haste, vigilance, lifelink, deathtouch, defender
-- Enters-the-battlefield abilities, "until end of turn" boosts
+- Enters-the-battlefield abilities (several per card), "until end of turn" boosts
+- Extra cards and decks from card packs
 - You lose at 0 life or by drawing from an empty library; conceding or disconnecting forfeits
 
 To keep play fast, the engine passes priority for you whenever you have
@@ -117,8 +180,8 @@ full control (`f`).
 
 ## Roadmap
 
-Planned work is in [TODO.md](TODO.md): mulligans, multiplayer/Commander, cards
-loaded from data files, a server database with accounts and trading, and a
+Planned work is in [TODO.md](TODO.md): mulligans, multiplayer/Commander, more
+card mechanics, a server database with accounts and trading, and a
 leaner wire protocol.
 
 ## Contributing
@@ -134,8 +197,9 @@ agents but is the best map of the code for humans too. It covers the design
 rules: the server is the only authority, hidden information stays hidden, and
 every new decision type needs a `Prompt`.
 
-Adding a card today means a line in `crates/magus-core/src/cards.rs`. Cards
+Adding a built-in card means a line in `crates/magus-core/src/cards.rs`; to
+try one out without touching the engine, put it in a card pack instead. Cards
 must be original; don't copy names or text from real games. If the card does
-something new, add an `Effect` variant in `card.rs` and handle it in
-`Game::apply_effect`. The bot (`magus-bot`) is a quick way to playtest: run two
+something new, add a reusable building block (an `Effect` or `Trigger`
+variant in `card.rs`) rather than code for that one card. The bot (`magus-bot`) is a quick way to playtest: run two
 of them against each other, or play one yourself.

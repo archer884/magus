@@ -58,22 +58,35 @@ pub struct ManaCost {
 
 impl ManaCost {
     /// Parses compact notation: `"2RR"` is two generic plus two red.
+    ///
+    /// Panics on a malformed cost; use [`ManaCost::try_parse`] for untrusted text.
     pub fn parse(s: &str) -> ManaCost {
+        ManaCost::try_parse(s).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Like [`ManaCost::parse`], but reports a malformed cost instead of panicking.
+    pub fn try_parse(s: &str) -> Result<ManaCost, String> {
         let mut cost = ManaCost::default();
         let mut digits = String::new();
         for ch in s.chars() {
             if ch.is_ascii_digit() {
+                // "1R1" would otherwise quietly mean eleven generic mana.
+                if cost.colored.iter().any(|&n| n > 0) {
+                    return Err(format!("generic mana must come first in cost {s:?}"));
+                }
                 digits.push(ch);
             } else if let Some(color) = Color::from_symbol(ch) {
                 cost.colored[color.index()] += 1;
             } else {
-                panic!("bad mana symbol {ch:?} in {s:?}");
+                return Err(format!("bad mana symbol {ch:?} in cost {s:?}"));
             }
         }
         if !digits.is_empty() {
-            cost.generic = digits.parse().expect("generic mana fits in u32");
+            cost.generic = digits
+                .parse()
+                .map_err(|_| format!("generic mana in {s:?} is too large"))?;
         }
-        cost
+        Ok(cost)
     }
 
     pub fn mana_value(&self) -> u32 {
@@ -139,6 +152,8 @@ mod tests {
         assert_eq!(cost.mana_value(), 4);
         assert_eq!(cost.to_string(), "{2}{R}{R}");
         assert_eq!(ManaCost::parse("").to_string(), "");
+        assert!(ManaCost::try_parse("2X").is_err());
+        assert!(ManaCost::try_parse("1R1").is_err());
     }
 
     #[test]

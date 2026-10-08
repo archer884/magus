@@ -3,8 +3,8 @@
 use crate::card::CardKind::{Instant, Sorcery};
 use crate::card::Effect::*;
 use crate::card::Keyword::*;
-use crate::card::TargetKind;
-use crate::card::{CardDef, CardKind, Effect, Keyword};
+use crate::card::Who::{EachOpponent, You};
+use crate::card::{Ability, CardDef, CardKind, Effect, Keyword, TargetKind, Trigger};
 use crate::mana::Color;
 
 const fn land(key: &'static str, name: &'static str, color: Color) -> CardDef {
@@ -16,6 +16,7 @@ const fn land(key: &'static str, name: &'static str, color: Color) -> CardDef {
         subtype: "",
         keywords: &[],
         effects: &[],
+        abilities: &[],
     }
 }
 
@@ -28,7 +29,7 @@ const fn creature(
     power: i32,
     toughness: i32,
     keywords: &'static [Keyword],
-    effects: &'static [Effect],
+    abilities: &'static [Ability],
 ) -> CardDef {
     CardDef {
         key,
@@ -37,7 +38,8 @@ const fn creature(
         kind: CardKind::Creature { power, toughness },
         subtype,
         keywords,
-        effects,
+        effects: &[],
+        abilities,
     }
 }
 
@@ -55,6 +57,15 @@ const fn spell(
         kind,
         subtype: "",
         keywords: &[],
+        effects,
+        abilities: &[],
+    }
+}
+
+/// "When this creature enters, do `effects`."
+const fn enters(effects: &'static [Effect]) -> Ability {
+    Ability::Triggered {
+        when: Trigger::Enters,
         effects,
     }
 }
@@ -86,7 +97,10 @@ pub static CARDS: &[CardDef] = &[
         2,
         2,
         &[],
-        &[GainLife(2)],
+        &[enters(&[GainLife {
+            who: You,
+            amount: 2,
+        }])],
     ),
     creature(
         "skyreach-griffin",
@@ -123,7 +137,10 @@ pub static CARDS: &[CardDef] = &[
         "Mending Light",
         "W",
         Instant,
-        &[GainLife(4)],
+        &[GainLife {
+            who: You,
+            amount: 4,
+        }],
     ),
     spell(
         "rally-cry",
@@ -165,7 +182,7 @@ pub static CARDS: &[CardDef] = &[
         1,
         3,
         &[],
-        &[Draw(1)],
+        &[enters(&[Draw { who: You, count: 1 }])],
     ),
     creature(
         "mistwing-drake",
@@ -200,7 +217,7 @@ pub static CARDS: &[CardDef] = &[
         "Glimpse Beyond",
         "2U",
         Instant,
-        &[Draw(2)],
+        &[Draw { who: You, count: 2 }],
     ),
     // Black: removal, drain, costs paid in life
     creature(
@@ -231,7 +248,10 @@ pub static CARDS: &[CardDef] = &[
         3,
         3,
         &[],
-        &[DamageEachOpponent(2)],
+        &[enters(&[DamagePlayers {
+            who: EachOpponent,
+            amount: 2,
+        }])],
     ),
     creature(
         "bone-colossus",
@@ -254,7 +274,10 @@ pub static CARDS: &[CardDef] = &[
                 amount: 2,
                 target: ANY,
             },
-            GainLife(2),
+            GainLife {
+                who: You,
+                amount: 2,
+            },
         ],
     ),
     spell(
@@ -262,7 +285,13 @@ pub static CARDS: &[CardDef] = &[
         "Dark Bargain",
         "1B",
         Sorcery,
-        &[Draw(2), LoseLife(2)],
+        &[
+            Draw { who: You, count: 2 },
+            LoseLife {
+                who: You,
+                amount: 2,
+            },
+        ],
     ),
     // Red: haste, burn
     creature(
@@ -303,7 +332,10 @@ pub static CARDS: &[CardDef] = &[
         4,
         3,
         &[],
-        &[DamageEachOpponent(1)],
+        &[enters(&[DamagePlayers {
+            who: EachOpponent,
+            amount: 1,
+        }])],
     ),
     creature(
         "ashen-wyrm",
@@ -403,7 +435,13 @@ pub static CARDS: &[CardDef] = &[
         "Verdant Bounty",
         "1G",
         Sorcery,
-        &[GainLife(3), Draw(1)],
+        &[
+            GainLife {
+                who: You,
+                amount: 3,
+            },
+            Draw { who: You, count: 1 },
+        ],
     ),
 ];
 
@@ -500,39 +538,27 @@ pub static DECKS: &[DeckList] = &[
     },
 ];
 
-pub fn deck(key: &str) -> Option<&'static DeckList> {
-    DECKS.iter().find(|d| d.key == key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The rest of the pool's invariants are checked by `CardPool::problems`
+    /// (see `pool.rs`), which can't see duplicates once keys are in a map.
     #[test]
-    fn decks_are_sixty_known_cards() {
-        for deck in DECKS {
-            assert_eq!(deck.size(), 60, "{}", deck.key);
-            for (key, _) in deck.cards {
-                assert!(card(key).is_some(), "{} lists unknown card {key}", deck.key);
-            }
-        }
-    }
-
-    #[test]
-    fn card_definitions_are_well_formed() {
+    fn card_and_deck_keys_are_unique() {
         for (i, def) in CARDS.iter().enumerate() {
             assert!(
                 CARDS[..i].iter().all(|c| c.key != def.key),
-                "duplicate key {}",
+                "duplicate card key {}",
                 def.key
             );
-            let _ = def.mana_cost();
-            let targeted = def.effects.iter().filter(|e| e.target().is_some()).count();
-            if def.is_creature() {
-                assert_eq!(targeted, 0, "{}: creature abilities can't target", def.key);
-            } else {
-                assert!(targeted <= 1, "{}: at most one targeted effect", def.key);
-            }
+        }
+        for (i, deck) in DECKS.iter().enumerate() {
+            assert!(
+                DECKS[..i].iter().all(|d| d.key != deck.key),
+                "duplicate deck key {}",
+                deck.key
+            );
         }
     }
 }

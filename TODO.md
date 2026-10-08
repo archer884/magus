@@ -36,25 +36,22 @@ how the codebase fits together before picking something up.
 
 ## Cards as data
 
-- [ ] **Load the card pool and decklists from data files** instead of the
-      `static CARDS` array in `magus-core/src/cards.rs`. Probably TOML or JSON
-      (rich enough for effects); CSV only fits flat fields. A sketch:
-      ```toml
-      [[card]]
-      key = "blaze"
-      name = "Blaze"
-      cost = "1R"
-      kind = "instant"
-      effects = [{ damage = { amount = 3, target = "any" } }]
-      ```
-      `CardDef` currently uses `&'static` fields, so either leak the loaded data
-      (`Box::leak`, which is fine for a process-lifetime card pool) or switch to
-      owned `String`s/`Arc<CardDef>`. Validate on load: one targeted effect per
-      spell, no targeted creature effects, and decklists that reference real
-      keys. Those checks are unit tests today; see `cards.rs` tests.
+- [x] Card packs: extra cards and decks loaded from TOML (`--cards`), added
+      to the built-in pool (`magus-core/src/pool.rs`). Built-in cards stay in
+      Rust for now.
+- [ ] **Event-driven triggers**: an event queue (`Entered`, `DamageDealt`,
+      `Died`…) checked in `settle()`, so abilities can trigger on more than
+      entering. Then `Trigger::DealsCombatDamageToPlayer`, `Who::ThatPlayer`,
+      `Effect::LoseGame`, and `Condition` (with `cast_from` on objects).
+      Test card: a "Blightmaw Tyrant" fixture pack (enters: you lose unless it
+      was cast from the command zone; combat damage to a player: they lose).
+- [ ] The bot only knows built-in cards (`cards::card`), so it never casts a
+      pack's targeted spells. It needs card definitions from the server (see
+      next item), or a hint in the prompt about what a spell does.
+- [ ] Accept JSON packs as well as TOML (choose by file extension), for the
+      card builder and a web client.
 - [ ] Ship the card pool with the server and send card definitions to clients
       (pairs with the protocol work below).
-- [ ] A small effect DSL as the card pool outgrows the `Effect` enum.
 
 ## Server: persistence, accounts, trading
 
