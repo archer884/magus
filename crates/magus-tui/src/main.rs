@@ -1,5 +1,6 @@
 mod app;
 mod builder;
+mod cardbuilder;
 mod deckfile;
 mod ui;
 
@@ -37,6 +38,12 @@ enum Command {
         /// A card pack (TOML) whose cards to offer too. Repeat for several.
         #[arg(long = "cards", value_name = "PATH")]
         packs: Vec<PathBuf>,
+    },
+    /// Create and edit your own cards, saved as a card pack.
+    CardBuilder {
+        /// The pack file: opened for editing if it exists, created otherwise.
+        #[arg(long, short)]
+        pack: PathBuf,
     },
 }
 
@@ -119,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::DeckBuilder { deck, packs }) => builder::run(&deck, &packs),
+        Some(Command::CardBuilder { pack }) => cardbuilder::run(&pack),
         None => play(cli.play).await,
     }
 }
@@ -336,12 +344,13 @@ mod tests {
     fn choose_card_popup() {
         let (mut view, mut app, mut rx) = started();
         let card = view.hand[0].clone();
-        view.prompt = Prompt::ChooseCard {
+        view.prompt = Prompt::ChooseCards {
             reason: "Beckon the Wild: you may put a creature card from your hand onto the \
                      battlefield"
                 .into(),
-            options: vec![card.id],
-            optional: true,
+            options: vec![card.clone()],
+            min: 0,
+            max: 1,
         };
         app.on_server(ServerMsg::State {
             view: Box::new(view),
@@ -356,7 +365,7 @@ mod tests {
         let Ok(ClientMsg::Act { action, .. }) = rx.try_recv() else {
             panic!("no action sent")
         };
-        assert_eq!(action, Action::ChooseCard { card: None });
+        assert_eq!(action, Action::ChooseCards { cards: vec![] });
     }
 
     #[test]
@@ -395,5 +404,163 @@ mod tests {
         let missing = crate::deck_choice("nope.toml").unwrap_err().to_string();
         assert_eq!(missing, "no deck file at nope.toml");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn choosing_how_to_cast() {
+        use magus_core::view::{CastWay, PlayKind, PlayOption};
+        let (mut view, mut app, mut rx) = started();
+        let card = view.hand[0].clone();
+        let way = CastWay {
+            option: 0,
+            fetch: "bog".into(),
+            fetch_name: "Bog".into(),
+        };
+        let play = |cost: &str, way: Option<CastWay>| PlayOption {
+            card: card.id,
+            kind: PlayKind::Spell,
+            targets: None,
+            cost: cost.into(),
+            way,
+            ability: None,
+        };
+        view.prompt = Prompt::Priority {
+            plays: vec![play("{2}{B}{B}", None), play("{2}{B}", Some(way.clone()))],
+        };
+        app.on_server(ServerMsg::State {
+            view: Box::new(view),
+        });
+        app.on_key(key(KeyCode::Enter)); // the first card in hand
+        let shown = screen(&app);
+        println!("{shown}");
+        assert!(shown.contains("Cast normally"));
+        assert!(shown.contains("Cast bringing Bog"));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        let Ok(ClientMsg::Act { action, .. }) = rx.try_recv() else {
+            panic!("no action sent")
+        };
+        assert_eq!(
+            action,
+            Action::Cast {
+                card: card.id,
+                target: None,
+                way: Some(way),
+            }
+        );
+    }
+
+    /// A planeswalker from the sample pack, as a permanent view.
+    fn planeswalker(id: u32, controller: usize, loyalty: i32) -> magus_core::view::PermanentView {
+        let pack = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../magus-core/tests/fixtures/sample-pack.toml"
+        );
+        let pool = magus_server::load_pool(&[pack]).unwrap();
+        let def = pool.card("ilsa-tide-warden").unwrap();
+        magus_core::view::PermanentView {
+            card: magus_core::view::CardView::new(magus_core::ObjectId(id), def),
+            controller,
+            owner: controller,
+            tapped: false,
+            summoning_sick: false,
+            damage: 0,
+            power: None,
+            toughness: None,
+            keywords: vec![],
+            loyalty: Some(loyalty),
+            attacking: None,
+            attacking_planeswalker: None,
+            blocking: None,
+        }
+    }
+
+    #[test]
+    fn activating_a_planeswalker_from_the_board() {
+        use magus_core::view::{PlayKind, PlayOption};
+        let (mut view, mut app, mut rx) = started();
+        let me = view.you;
+        let ilsa = planeswalker(900, me, 4);
+        let id = ilsa.card.id;
+        view.battlefield.push(ilsa);
+        view.players[me].emblems = vec!["Creatures you control get +2/+2 and have flying.".into()];
+        let ability = |i: usize, cost: &str, text: &str| PlayOption {
+            card: id,
+            kind: PlayKind::Ability(i),
+            targets: None,
+            cost: cost.into(),
+            way: None,
+            ability: Some(text.into()),
+        };
+        view.prompt = Prompt::Priority {
+            plays: vec![
+                ability(0, "+1", "+1: Draw a card."),
+                ability(2, "\u{2212}5", "\u{2212}5: You get an emblem."),
+            ],
+        };
+        app.on_server(ServerMsg::State {
+            view: Box::new(view),
+        });
+        let shown = screen(&app);
+        assert!(shown.contains("Ilsa, Tide Warden [4]"), "{shown}");
+        assert!(shown.contains("Emblem: Creatures you control get +2/+2 and have flying."));
+
+        app.on_key(key(KeyCode::Tab)); // the battlefield
+        app.on_key(key(KeyCode::Enter));
+        let shown = screen(&app);
+        println!("{shown}");
+        assert!(shown.contains("Activate Ilsa, Tide Warden"));
+        assert!(shown.contains("+1: Draw a card."));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        let Ok(ClientMsg::Act { action, .. }) = rx.try_recv() else {
+            panic!("no action sent")
+        };
+        assert_eq!(
+            action,
+            Action::Activate {
+                card: id,
+                ability: 2,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn attacking_a_planeswalker() {
+        use magus_core::view::AttackOption;
+        let (mut view, mut app, mut rx) = started();
+        let (me, them) = (view.you, 1 - view.you);
+        let ilsa = planeswalker(900, them, 4);
+        let pw = ilsa.card.id;
+        view.battlefield.push(ilsa);
+        let attacker = view.hand[0].id; // any id will do for the prompt
+        view.prompt = Prompt::DeclareAttackers {
+            options: vec![AttackOption {
+                attacker,
+                defenders: vec![them],
+                planeswalkers: vec![pw],
+            }],
+        };
+        assert_ne!(me, them);
+        app.on_server(ServerMsg::State {
+            view: Box::new(view),
+        });
+        app.on_key(key(KeyCode::Right)); // the player
+        app.on_key(key(KeyCode::Right)); // the planeswalker
+        app.on_key(key(KeyCode::Enter));
+        let Ok(ClientMsg::Act { action, .. }) = rx.try_recv() else {
+            panic!("no action sent")
+        };
+        assert_eq!(
+            action,
+            Action::DeclareAttackers {
+                attacks: vec![magus_core::Attack {
+                    attacker,
+                    defender: them,
+                    planeswalker: Some(pw),
+                }],
+            }
+        );
     }
 }

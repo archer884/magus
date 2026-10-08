@@ -83,14 +83,8 @@ fn fallback(view: &GameView) -> Option<Action> {
         Prompt::Discard { count } => Action::Discard {
             cards: view.hand.iter().take(*count).map(|c| c.id).collect(),
         },
-        Prompt::ChooseCard {
-            options, optional, ..
-        } => Action::ChooseCard {
-            card: if *optional {
-                None
-            } else {
-                options.first().copied()
-            },
+        Prompt::ChooseCards { options, min, .. } => Action::ChooseCards {
+            cards: options.iter().take(*min).map(|c| c.id).collect(),
         },
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => return None,
     })
@@ -100,16 +94,35 @@ fn fallback(view: &GameView) -> Option<Action> {
 pub fn choose(view: &GameView) -> Option<Action> {
     match &view.prompt {
         Prompt::Priority { plays } => Some(choose_play(view, plays)),
-        Prompt::DeclareAttackers { options } => Some(Action::DeclareAttackers {
-            attacks: options
+        Prompt::DeclareAttackers { options } => {
+            // Send the first attacker at the weakest enemy planeswalker, if
+            // there is one; everyone else at the player.
+            let mut planeswalkers: Vec<_> = options
+                .first()
+                .map(|o| o.planeswalkers.clone())
+                .unwrap_or_default();
+            planeswalkers.sort_by_key(|&pw| view.permanent(pw).and_then(|p| p.loyalty));
+            let mut target = planeswalkers.first().copied();
+            let attacks = options
                 .iter()
                 .filter(|o| should_attack(view, o.attacker))
-                .map(|o| Attack {
-                    attacker: o.attacker,
-                    defender: o.defenders[0],
-                })
-                .collect(),
-        }),
+                .map(
+                    |o| match target.take().and_then(|pw| Some((pw, view.permanent(pw)?))) {
+                        Some((pw, perm)) => Attack {
+                            attacker: o.attacker,
+                            defender: perm.controller,
+                            planeswalker: Some(pw),
+                        },
+                        None => Attack {
+                            attacker: o.attacker,
+                            defender: o.defenders[0],
+                            planeswalker: None,
+                        },
+                    },
+                )
+                .collect();
+            Some(Action::DeclareAttackers { attacks })
+        }
         Prompt::DeclareBlockers { options } => Some(Action::DeclareBlockers {
             blocks: choose_blocks(view, options),
         }),
@@ -132,24 +145,43 @@ pub fn choose(view: &GameView) -> Option<Action> {
                 cards: hand.iter().take(*count).map(|c| c.id).collect(),
             })
         }
-        // The only choice so far is which creature to put onto the
-        // battlefield: the best one that won't make us lose.
-        Prompt::ChooseCard {
-            options, optional, ..
+        // Putting a creature onto the battlefield or searching: take the
+        // best cards, never one that would make us lose, and lands while
+        // we're short of them.
+        Prompt::ChooseCards {
+            options, min, max, ..
         } => {
-            let best = options
+            // The legend rule: keep the planeswalker with the most loyalty
+            // (or, for anything else, the first).
+            if *min > 0 {
+                let keep = options
+                    .iter()
+                    .max_by_key(|c| view.permanent(c.id).and_then(|p| p.loyalty))
+                    .map(|c| c.id);
+                return Some(Action::ChooseCards {
+                    cards: keep.into_iter().collect(),
+                });
+            }
+            let lands_out = view
+                .battlefield
                 .iter()
-                .filter_map(|&id| {
-                    let def = cards::card(&view.hand_card(id)?.key)?;
-                    (!loses_on_entering(def)).then_some((id, card_value(def)))
+                .filter(|p| p.controller == view.you && p.card.is_land)
+                .count();
+            let mut ranked: Vec<_> = options
+                .iter()
+                .filter(|c| cards::card(&c.key).is_none_or(|def| !loses_on_entering(def)))
+                .map(|c| {
+                    let value = if c.is_land {
+                        if lands_out < 5 { 20 } else { 0 }
+                    } else {
+                        cards::card(&c.key).map_or(c.mana_value as i32, card_value)
+                    };
+                    (value, c.id)
                 })
-                .max_by_key(|(_, value)| *value)
-                .map(|(id, _)| id);
-            let card = match best {
-                None if !*optional => options.first().copied(),
-                best => best,
-            };
-            Some(Action::ChooseCard { card })
+                .collect();
+            ranked.sort_by_key(|&(value, _)| std::cmp::Reverse(value));
+            let cards = ranked.into_iter().take(*max).map(|(_, id)| id).collect();
+            Some(Action::ChooseCards { cards })
         }
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => None,
     }
@@ -185,6 +217,9 @@ fn choose_play(view: &GameView, plays: &[PlayOption]) -> Action {
     if let Some(land) = plays.iter().find(|p| p.kind == PlayKind::Land) {
         return Action::PlayLand { card: land.card };
     }
+    if let Some(action) = choose_ability(view, plays) {
+        return action;
+    }
     let mut spells: Vec<_> = plays
         .iter()
         .filter(|p| p.kind == PlayKind::Spell)
@@ -195,7 +230,8 @@ fn choose_play(view: &GameView, plays: &[PlayOption]) -> Action {
             Some((p, card))
         })
         .collect();
-    spells.sort_by_key(|(_, c)| std::cmp::Reverse(c.mana_value));
+    // Biggest first; for the same card, a cheaper way to cast it first.
+    spells.sort_by_key(|(p, c)| (std::cmp::Reverse(c.mana_value), p.way.is_none()));
     for (play, card) in spells {
         let Some(def) = cards::card(&card.key) else {
             continue;
@@ -207,6 +243,7 @@ fn choose_play(view: &GameView, plays: &[PlayOption]) -> Action {
                 return Action::Cast {
                     card: play.card,
                     target: None,
+                    way: play.way.clone(),
                 };
             }
             Some(targets) => {
@@ -214,12 +251,97 @@ fn choose_play(view: &GameView, plays: &[PlayOption]) -> Action {
                     return Action::Cast {
                         card: play.card,
                         target: Some(target),
+                        way: play.way.clone(),
                     };
                 }
             }
         }
     }
     Action::Pass
+}
+
+/// Uses a planeswalker's loyalty ability, or a {T} ability, if any is worth it.
+///
+/// For a planeswalker: its biggest minus ability that leaves it alive and has
+/// a good target, else a plus ability (building toward the big one).
+fn choose_ability(view: &GameView, plays: &[PlayOption]) -> Option<Action> {
+    let loyalty_cost = |p: &PlayOption| -> Option<i32> {
+        p.cost
+            .replace('\u{2212}', "-")
+            .trim_start_matches('+')
+            .parse()
+            .ok()
+    };
+    let target_for = |play: &PlayOption| -> Option<Option<Target>> {
+        let PlayKind::Ability(i) = play.kind else {
+            return None;
+        };
+        match &play.targets {
+            None => Some(None),
+            Some(targets) => {
+                let card = view.permanent(play.card)?;
+                let def = cards::card(&card.card.key);
+                let effects = def.map(|d| d.abilities[i].effects()).unwrap_or(&[]);
+                // Without the card's definition, any target that isn't ours.
+                let target = pick_target(view, effects, targets).or_else(|| {
+                    targets.iter().copied().find(|t| match t {
+                        Target::Player(p) => *p != view.you,
+                        Target::Permanent(id) => view
+                            .permanent(*id)
+                            .is_some_and(|p| p.controller != view.you),
+                        _ => false,
+                    })
+                })?;
+                Some(Some(target))
+            }
+        }
+    };
+    let activate = |play: &PlayOption, target| {
+        let PlayKind::Ability(ability) = play.kind else {
+            unreachable!("only abilities")
+        };
+        Action::Activate {
+            card: play.card,
+            ability,
+            target,
+        }
+    };
+    let abilities: Vec<&PlayOption> = plays
+        .iter()
+        .filter(|p| matches!(p.kind, PlayKind::Ability(_)))
+        .collect();
+    let mut cards: Vec<_> = abilities.iter().map(|p| p.card).collect();
+    cards.dedup();
+    for card in cards {
+        let mine: Vec<_> = abilities.iter().filter(|p| p.card == card).collect();
+        let loyalty = view.permanent(card).and_then(|p| p.loyalty);
+        if let Some(loyalty) = loyalty {
+            let mut minus: Vec<_> = mine
+                .iter()
+                .filter_map(|p| Some((loyalty_cost(p)?, **p)))
+                .filter(|(cost, _)| *cost < 0 && loyalty + cost >= 1)
+                .collect();
+            minus.sort_by_key(|(cost, _)| *cost);
+            for (_, play) in minus {
+                if let Some(target) = target_for(play) {
+                    return Some(activate(play, target));
+                }
+            }
+            let plus = mine
+                .iter()
+                .find(|p| loyalty_cost(p).is_some_and(|c| c >= 0))?;
+            let target = target_for(plus)?;
+            return Some(activate(plus, target));
+        }
+        // A {T} ability: use it when it has a target worth hitting.
+        if let Some(play) = mine.first()
+            && play.targets.is_some()
+            && let Some(target) = target_for(play)
+        {
+            return Some(activate(play, target));
+        }
+    }
+    None
 }
 
 fn pick_target(view: &GameView, effects: &[Effect], targets: &[Target]) -> Option<Target> {
@@ -293,8 +415,8 @@ fn card_value(def: &CardDef) -> i32 {
 /// Whether a card makes its controller lose when it enters without being cast.
 fn loses_on_entering(def: &CardDef) -> bool {
     def.abilities.iter().any(|a| {
-        let Ability::Triggered { when, effects, .. } = a;
-        *when == Trigger::Enters && effects.contains(&Effect::LoseGame { who: Who::You })
+        matches!(a, Ability::Triggered { when: Trigger::Enters, effects, .. }
+            if effects.contains(&Effect::LoseGame { who: Who::You }))
     })
 }
 

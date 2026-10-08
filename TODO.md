@@ -11,14 +11,21 @@ how the codebase fits together before picking something up.
 - [ ] **First strike / double strike.** These need a second combat-damage step.
 - [ ] **Trample**, plus letting the attacker choose damage assignment order
       (currently it's block order, and assignment is automatic).
-- [ ] **Activated abilities** ("{T}: deal 1 damage…"), and tapping mana by
-      hand when the auto-payer picks badly. Auto-pay is fine for basic lands
-      only; dual lands or mana creatures would need a real solver.
+- [x] Activated abilities (loyalty, {T}, mana costs) and planeswalkers.
+- [ ] Tapping mana by hand when the auto-payer picks badly. Auto-pay is fine
+      for basic lands only; dual lands or mana abilities ("{T}: add {G}" on a
+      creature) would need a real solver.
 - [ ] **Targeted triggers** (e.g. "when this enters, destroy target creature").
       Creature triggers can't target today, because the trigger would need a
       new prompt to choose its target.
-- [ ] **Static effects and auras/equipment** (layers-lite).
-- [ ] **Tokens, counters (+1/+1), exile, "dies" triggers.**
+- [x] Static abilities and emblems: creatures get +X/+Y and/or a keyword
+      (`Boost`), computed through `Game::power`/`toughness`/`has_keyword`.
+- [ ] More static effects beyond boosts (boosts can already be negative or
+      aimed at opponents' creatures): "can't block", cost reductions, and
+      auras/equipment (attached to one creature).
+- [ ] Emblems with triggered abilities ("At the beginning of your upkeep,
+      draw a card"), which need more triggers.
+- [ ] **Tokens, +1/+1 counters (reuse `Counter`), "dies" triggers.**
 - [ ] **Hexproof / shroud / protection** (they affect `valid_targets`).
 - [x] A card that changes zones is treated as a new object for targeting
       (`Object::moves`), so blink and bounce-and-recast make spells fizzle.
@@ -30,15 +37,16 @@ how the codebase fits together before picking something up.
 - [ ] Commander format: 100-card singleton decks, 40 life, a command zone, a
       commander tax (+2 to recast each time), 21 commander combat damage
       knocks a player out, and a color-identity check at deck validation.
-- [ ] Legendary creatures and the "legend rule."
+- [x] Legendary permanents and the legend rule (the player chooses).
 - [ ] TUI layout for several opponents. It currently stacks opponent panels
       vertically, which won't fit 3 opponents on small terminals.
 
 ## Cards as data
 
-- [ ] **Flavor text**: an optional `flavor` field on cards (TOML multi-line
-      strings work well), shown in italics under the rules text, with no
-      effect on the game.
+- [x] **Flavor text** (`flavor`), shown in italics under the rules text.
+- [x] **Card builder** (`magus card-builder --pack pack.toml`).
+- [ ] Card builder: multi-line flavor text (its text field is one line; TOML
+      files can have several), and editing a pack's decks.
 - [ ] **Card art** in packs: an optional `art` field (ASCII art inline, or a
       path to an image). See the card view under Clients.
 - [x] Card packs: extra cards and decks loaded from TOML (`--cards`), added
@@ -63,12 +71,20 @@ how the codebase fits together before picking something up.
       (`Pending::Choose`), and `whose` target restrictions. Built-in cards:
       Sparkfall, Beckon the Wild; Veilstep now targets your own creature.
 - [x] Color mana symbols in the TUI wherever costs appear.
+- [x] Library search (`search`: filter, count, to hand / battlefield
+      (tapped) / top of library), choosing several cards, and cast options
+      ("as you cast this, you may search…; if you do, it costs less").
+- [ ] **Tokens**: `create_token` with an inline token description (name,
+      power/toughness, color, subtype, keywords, count). Tokens vanish when
+      they leave the battlefield; the fuzz card count must skip them.
+- [ ] More cast option actions: pay life (or Phyrexian-style {B/P} mana),
+      discard a card, sacrifice a creature, tap creatures (convoke). Each is a
+      choice made while casting.
 - [ ] More choices during resolution: "choose a card in your graveyard",
-      "search your library" (hidden information: only the chooser may see
-      the options, and the library must be shuffled afterwards), "choose one
-      of these modes".
+      "choose one of these modes".
 - [ ] Target filters beyond kind + whose (e.g. "creature with flying",
-      "power 3 or less"). If these multiply, make the target a filter struct.
+      "power 3 or less"). The search's `CardFilter` could grow these fields
+      and be reused for targets.
 - [ ] The bot only knows built-in cards (`cards::card`), so it never casts a
       pack's targeted spells. It needs card definitions from the server (see
       next item), or a hint in the prompt about what a spell does.
@@ -139,6 +155,11 @@ average, ~12.6 KB max** per message. Every change resends the *entire*
 
 ## Clients
 
+- [ ] **Card editor**: currently, it's basically not possible to add an on-cast
+      effect that isn't EXACTLY the one that we discussed. Like, it'll complain
+      that the cost reduction requires the effect to be a search or whatever--
+      which is just kind of silly, given that cost reductions usually involve
+      some other mechanic entirely.
 - [ ] **Card view**: an inspect screen that draws a whole "virtual card"
       (name and cost bar, art box, type line, rules text, flavor text,
       power/toughness). Art is optional: ASCII art from the pack, or a real

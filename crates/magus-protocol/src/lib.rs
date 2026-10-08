@@ -17,7 +17,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEFAULT_PORT: u16 = 7878;
 const MAX_LINE: usize = 1 << 20;
 
@@ -166,6 +166,7 @@ mod tests {
             action: Action::Cast {
                 card: magus_core::ObjectId(9),
                 target: Some(Target::Player(1)),
+                way: None,
             },
         };
         let line = encode(&msg);

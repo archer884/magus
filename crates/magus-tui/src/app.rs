@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use magus_core::view::{AttackOption, BlockOption, CardView, PlayKind, Prompt};
+use magus_core::view::{
+    AttackOption, BlockOption, CardView, CastWay, PlayKind, PlayOption, Prompt,
+};
 use magus_core::{Action, Attack, Block, GameView, ObjectId, PlayerId, Step, Target};
 use magus_protocol::{ClientMsg, CustomDeck, DeckInfo, ServerMsg};
 use tokio::sync::mpsc::UnboundedSender;
@@ -29,6 +31,17 @@ pub enum Mode {
         card: ObjectId,
         targets: Vec<Target>,
         sel: usize,
+        /// How the card is being cast, if one of its optional ways.
+        way: Option<CastWay>,
+        /// Set when this is for activating the card's ability with this
+        /// index, rather than casting it.
+        ability: Option<usize>,
+    },
+    /// Picking how to cast a card that can be cast more than one way, or
+    /// which of a permanent's abilities to activate.
+    CastWay {
+        plays: Vec<PlayOption>,
+        sel: usize,
     },
     Attack {
         options: Vec<AttackOption>,
@@ -48,13 +61,16 @@ pub enum Mode {
     Graveyard {
         sel: usize,
     },
-    /// Answering a [`Prompt::ChooseCard`]. When `optional`, the entry after
-    /// the last option means "nothing".
+    /// Answering a [`Prompt::ChooseCards`]. When `min` is 0, the entry after
+    /// the last option means "nothing". `marked` are the cards chosen so far,
+    /// in order.
     Choose {
         reason: String,
-        options: Vec<ObjectId>,
-        optional: bool,
+        options: Vec<CardView>,
+        min: usize,
+        max: usize,
         sel: usize,
+        marked: Vec<ObjectId>,
     },
 }
 
@@ -168,15 +184,18 @@ impl App {
                 options: options.clone(),
                 sel: 0,
             },
-            Prompt::ChooseCard {
+            Prompt::ChooseCards {
                 reason,
                 options,
-                optional,
+                min,
+                max,
             } => Mode::Choose {
                 reason: reason.clone(),
                 options: options.clone(),
-                optional: *optional,
+                min: *min,
+                max: *max,
                 sel: 0,
+                marked: Vec::new(),
             },
             Prompt::Discard { count } => {
                 self.focus = Focus::Hand;
@@ -254,7 +273,10 @@ impl App {
             }
             Mode::Discard { .. } => view.hand.get(self.hand_sel)?.id,
             Mode::Graveyard { sel } => graveyard_entries(view).get(*sel)?.1.id,
-            Mode::Choose { options, sel, .. } => *options.get(*sel)?,
+            // The options may be in a hidden zone (a search), so they come
+            // with the prompt rather than from the view.
+            Mode::Choose { options, sel, .. } => return options.get(*sel).cloned(),
+            Mode::CastWay { plays, .. } => plays.first()?.card,
             Mode::Idle => match self.focus {
                 Focus::Hand => view.hand.get(self.hand_sel)?.id,
                 Focus::Board => *self.board_order().get(self.board_sel)?,
@@ -378,16 +400,50 @@ impl App {
             }
             Mode::Choose {
                 options,
-                optional,
+                min,
+                max,
                 sel,
+                marked,
                 ..
             } => match key.code {
-                _ if up || down => step(sel, options.len() + usize::from(*optional), up),
-                KeyCode::Enter => {
-                    let card = options.get(*sel).copied();
-                    self.act(Action::ChooseCard { card });
+                _ if up || down => step(sel, options.len() + usize::from(*min == 0), up),
+                // Space marks cards when more than one may be chosen.
+                KeyCode::Char(' ') if *max > 1 => {
+                    if let Some(card) = options.get(*sel) {
+                        match marked.iter().position(|&id| id == card.id) {
+                            Some(i) => {
+                                marked.remove(i);
+                            }
+                            None if marked.len() < *max => marked.push(card.id),
+                            None => self.status = Some(format!("You can choose at most {max}.")),
+                        }
+                    }
                 }
-                KeyCode::Esc if *optional => self.act(Action::ChooseCard { card: None }),
+                KeyCode::Enter => {
+                    // The marked cards; with none marked, the one under the
+                    // cursor (or nothing, on the last row).
+                    let cards = if marked.is_empty() {
+                        options.get(*sel).map(|c| vec![c.id]).unwrap_or_default()
+                    } else {
+                        marked.clone()
+                    };
+                    if cards.len() < *min {
+                        self.status = Some(format!("Choose at least {min}."));
+                    } else {
+                        self.act(Action::ChooseCards { cards });
+                    }
+                }
+                KeyCode::Esc if *min == 0 => self.act(Action::ChooseCards { cards: vec![] }),
+                _ => {}
+            },
+            Mode::CastWay { plays, sel } => match key.code {
+                _ if up || down => step(sel, plays.len(), up),
+                KeyCode::Enter => {
+                    let play = plays[*sel].clone();
+                    self.mode = Mode::Idle;
+                    self.play_option(play);
+                }
+                KeyCode::Esc => self.mode = Mode::Idle,
                 _ => {}
             },
             Mode::Graveyard { sel } => match key.code {
@@ -406,12 +462,27 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('g') => self.mode = Mode::Idle,
                 _ => {}
             },
-            Mode::Target { card, targets, sel } => match key.code {
+            Mode::Target {
+                card,
+                targets,
+                sel,
+                way,
+                ability,
+            } => match key.code {
                 _ if up || down => step(sel, targets.len(), up),
                 KeyCode::Enter => {
-                    let action = Action::Cast {
-                        card: *card,
-                        target: targets.get(*sel).copied(),
+                    let target = targets.get(*sel).copied();
+                    let action = match ability {
+                        Some(ability) => Action::Activate {
+                            card: *card,
+                            ability: *ability,
+                            target,
+                        },
+                        None => Action::Cast {
+                            card: *card,
+                            target,
+                            way: way.clone(),
+                        },
                     };
                     self.act(action);
                 }
@@ -425,10 +496,12 @@ impl App {
             } => match key.code {
                 _ if up || down => step(sel, options.len(), up),
                 KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
-                    cycle(&mut chosen[*sel], options[*sel].defenders.len(), true)
+                    let n = attack_targets(&view, &options[*sel]).len();
+                    cycle(&mut chosen[*sel], n, true)
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
-                    cycle(&mut chosen[*sel], options[*sel].defenders.len(), false)
+                    let n = attack_targets(&view, &options[*sel]).len();
+                    cycle(&mut chosen[*sel], n, false)
                 }
                 KeyCode::Char('a') => {
                     let all = chosen.iter().all(Option::is_some);
@@ -441,9 +514,11 @@ impl App {
                         .iter()
                         .zip(chosen.iter())
                         .filter_map(|(o, c)| {
-                            c.map(|i| Attack {
+                            let (defender, planeswalker) = attack_targets(&view, o)[(*c)?];
+                            Some(Attack {
                                 attacker: o.attacker,
-                                defender: o.defenders[i],
+                                defender,
+                                planeswalker,
                             })
                         })
                         .collect();
@@ -506,14 +581,28 @@ impl App {
             self.status = Some("It isn't your priority.".into());
             return;
         }
-        if self.focus != Focus::Hand {
-            self.status = Some("Select a card in your hand (Tab) to play it.".into());
-            return;
+        match self.focus {
+            Focus::Hand => {
+                if let Some(card) = view.hand.get(self.hand_sel) {
+                    self.play_card(view, card);
+                }
+            }
+            // A permanent on the battlefield: activate one of its abilities.
+            Focus::Board => {
+                if let Some(perm) = self
+                    .board_order()
+                    .get(self.board_sel)
+                    .and_then(|&id| view.permanent(id))
+                {
+                    let card = perm.card.clone();
+                    self.play_card(view, &card);
+                }
+            }
+            Focus::Stack => {
+                self.status =
+                    Some("Select a card in your hand or on the battlefield (Tab).".into());
+            }
         }
-        let Some(card) = view.hand.get(self.hand_sel) else {
-            return;
-        };
-        self.play_card(view, card);
     }
 
     /// Plays `card` (from hand, or from the graveyard with flashback), asking for
@@ -523,21 +612,48 @@ impl App {
             self.status = Some("It isn't your priority.".into());
             return;
         };
-        let Some(play) = plays.iter().find(|p| p.card == card.id) else {
-            self.status = Some(format!("You can't play {} right now.", card.name));
-            return;
-        };
-        match (&play.kind, &play.targets) {
-            (PlayKind::Land, _) => self.act(Action::PlayLand { card: card.id }),
+        let ways: Vec<PlayOption> = plays
+            .iter()
+            .filter(|p| p.card == card.id)
+            .cloned()
+            .collect();
+        match ways.len() {
+            0 => self.status = Some(format!("You can't play {} right now.", card.name)),
+            1 => self.play_option(ways[0].clone()),
+            _ => {
+                self.mode = Mode::CastWay {
+                    plays: ways,
+                    sel: 0,
+                }
+            }
+        }
+    }
+
+    /// Plays one particular way of playing a card, asking for a target first
+    /// if it needs one.
+    fn play_option(&mut self, play: PlayOption) {
+        match (play.kind, play.targets) {
+            (PlayKind::Land, _) => self.act(Action::PlayLand { card: play.card }),
             (PlayKind::Spell, None) => self.act(Action::Cast {
-                card: card.id,
+                card: play.card,
+                target: None,
+                way: play.way,
+            }),
+            (PlayKind::Ability(ability), None) => self.act(Action::Activate {
+                card: play.card,
+                ability,
                 target: None,
             }),
-            (PlayKind::Spell, Some(targets)) => {
+            (kind, Some(targets)) => {
                 self.mode = Mode::Target {
-                    card: card.id,
-                    targets: targets.clone(),
+                    card: play.card,
+                    targets,
                     sel: 0,
+                    way: play.way,
+                    ability: match kind {
+                        PlayKind::Ability(i) => Some(i),
+                        _ => None,
+                    },
                 };
             }
         }
@@ -546,6 +662,17 @@ impl App {
     pub fn is_playable(&self, id: ObjectId) -> bool {
         matches!(&self.view, Some(GameView { prompt: Prompt::Priority { plays }, .. }) if plays.iter().any(|p| p.card == id))
     }
+}
+
+/// What an attacker may attack, in order: each player, then each planeswalker
+/// (with its controller, who defends it).
+pub fn attack_targets(view: &GameView, option: &AttackOption) -> Vec<(PlayerId, Option<ObjectId>)> {
+    let players = option.defenders.iter().map(|&p| (p, None));
+    let planeswalkers = option.planeswalkers.iter().filter_map(|&pw| {
+        let controller = view.permanent(pw)?.controller;
+        Some((controller, Some(pw)))
+    });
+    players.chain(planeswalkers).collect()
 }
 
 /// Every card in every graveyard, yours first, with its owner.

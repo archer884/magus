@@ -11,14 +11,14 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::card::{
-    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, TargetSpec,
-    Trigger, Who, Whose,
+    Ability, ActivationCost, Boost, CardDef, CardKind, CastZone, Condition, Destination, Effect,
+    Keyword, TargetKind, TargetSpec, Trigger, Who, Whose,
 };
 use crate::mana::{Color, ManaCost, plan_payment};
 use crate::pool::CardPool;
 use crate::view::{
-    AttackOption, BlockOption, CardView, GameView, PermanentView, PlayKind, PlayOption, PlayerView,
-    Prompt, StackItemView,
+    AttackOption, BlockOption, CardView, CastWay, GameView, PermanentView, PlayKind, PlayOption,
+    PlayerView, Prompt, StackItemView,
 };
 
 pub type PlayerId = usize;
@@ -55,7 +55,10 @@ impl Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attack {
     pub attacker: ObjectId,
+    /// The player attacked, or the controller of the planeswalker attacked.
     pub defender: PlayerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planeswalker: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +77,9 @@ pub enum Action {
     Cast {
         card: ObjectId,
         target: Option<Target>,
+        /// One of the card's optional ways to cast it, from its `PlayOption`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        way: Option<CastWay>,
     },
     DeclareAttackers {
         attacks: Vec<Attack>,
@@ -84,10 +90,16 @@ pub enum Action {
     Discard {
         cards: Vec<ObjectId>,
     },
-    /// Answers [`Prompt::ChooseCard`]: one of its options, or `None` to choose
-    /// nothing when that's allowed.
-    ChooseCard {
-        card: Option<ObjectId>,
+    /// Activates `card`'s activated ability with index `ability`.
+    Activate {
+        card: ObjectId,
+        ability: usize,
+        target: Option<Target>,
+    },
+    /// Answers [`Prompt::ChooseCards`]: up to `max` of its options, in order
+    /// (it matters when they go on top of a library: the first ends on top).
+    ChooseCards {
+        cards: Vec<ObjectId>,
     },
     Concede,
 }
@@ -141,6 +153,17 @@ impl fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
+/// Checks a chosen target against a play's valid targets.
+fn check_target(valid: &Option<Vec<Target>>, target: Option<Target>) -> Result<(), ActionError> {
+    match (valid, target) {
+        (None, None) => Ok(()),
+        (Some(valid), Some(t)) if valid.contains(&t) => Ok(()),
+        (Some(_), None) => reject("that needs a target"),
+        (None, Some(_)) => reject("that doesn't take a target"),
+        (Some(_), Some(_)) => reject("that isn't a legal target"),
+    }
+}
+
 fn reject<T>(msg: impl Into<String>) -> Result<T, ActionError> {
     Err(ActionError(msg.into()))
 }
@@ -178,6 +201,33 @@ struct Object {
     /// remembers this count for its target and loses track of the target if
     /// it changes (see `StackItem::target_moves`).
     moves: u32,
+    /// Counters on it, e.g. a planeswalker's loyalty.
+    counters: BTreeMap<Counter, i32>,
+    /// A planeswalker has used a loyalty ability this turn.
+    loyalty_used: bool,
+}
+
+/// A kind of counter placed on a permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Counter {
+    Loyalty,
+}
+
+/// Something boosting creatures: a permanent's static ability (`source`), or
+/// an emblem (`source` is `None`).
+#[derive(Debug, Clone, Copy)]
+struct BoostSource {
+    controller: PlayerId,
+    source: Option<ObjectId>,
+    /// "Other creatures": not the source itself.
+    other: bool,
+    boost: Boost,
+}
+
+/// An emblem a player has: a boost for the rest of the game.
+#[derive(Debug, Clone)]
+struct Emblem {
+    boost: Boost,
 }
 
 impl Object {
@@ -185,16 +235,8 @@ impl Object {
         self.def.is_creature()
     }
 
-    fn has(&self, keyword: Keyword) -> bool {
-        self.def.has(keyword)
-    }
-
-    fn power(&self) -> i32 {
-        self.def.power().unwrap_or(0) + self.power_mod
-    }
-
-    fn toughness(&self) -> i32 {
-        self.def.toughness().unwrap_or(0) + self.toughness_mod
+    fn loyalty(&self) -> i32 {
+        self.counters.get(&Counter::Loyalty).copied().unwrap_or(0)
     }
 }
 
@@ -207,6 +249,7 @@ struct Player {
     hand: Vec<ObjectId>,
     graveyard: Vec<ObjectId>,
     exile: Vec<ObjectId>,
+    emblems: Vec<Emblem>,
     lost: bool,
     drew_from_empty: bool,
 }
@@ -279,10 +322,21 @@ enum Pending {
 /// controller to choose a card. It stays on the stack until it finishes.
 #[derive(Debug, Clone)]
 struct Choosing {
-    item: StackItem,
-    /// The effect that asked, and so where to carry on after the choice.
-    effect: usize,
     options: Vec<ObjectId>,
+    min: usize,
+    max: usize,
+    why: ChoiceFor,
+}
+
+/// What a pending choice of cards is for.
+#[derive(Debug, Clone)]
+enum ChoiceFor {
+    /// A spell or ability paused partway through resolving, at the effect
+    /// that asked: it carries on from the next one.
+    Resolving { item: StackItem, effect: usize },
+    /// The legend rule: keep one of `options`, the rest go to the graveyard.
+    /// `resume` is what the game was waiting for before.
+    LegendRule { resume: Pending },
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +411,7 @@ impl Game {
                 hand: Vec::new(),
                 graveyard: Vec::new(),
                 exile: Vec::new(),
+                emblems: Vec::new(),
                 lost: false,
                 drew_from_empty: false,
             });
@@ -425,9 +480,17 @@ impl Game {
                 self.expect_priority(p)?;
                 self.play_land(p, card)?;
             }
-            Action::Cast { card, target } => {
+            Action::Cast { card, target, way } => {
                 self.expect_priority(p)?;
-                self.cast(p, card, target)?;
+                self.cast(p, card, target, way)?;
+            }
+            Action::Activate {
+                card,
+                ability,
+                target,
+            } => {
+                self.expect_priority(p)?;
+                self.activate(p, card, ability, target)?;
             }
             Action::DeclareAttackers { attacks } => {
                 if self.pending != Pending::Attackers(p) {
@@ -450,11 +513,11 @@ impl Game {
                 }
                 self.discard(p, count, cards)?;
             }
-            Action::ChooseCard { card } => {
+            Action::ChooseCards { cards } => {
                 if self.pending != Pending::Choose(p) {
-                    return reject("you aren't choosing a card");
+                    return reject("you aren't choosing cards");
                 }
-                self.choose(p, card)?;
+                self.choose(p, cards)?;
             }
         }
         self.version += 1;
@@ -463,6 +526,7 @@ impl Game {
     }
 
     pub fn view(&self, p: PlayerId) -> GameView {
+        let sources = self.boost_sources();
         GameView {
             version: self.version,
             you: p,
@@ -478,6 +542,11 @@ impl Game {
                     library_size: pl.library.len(),
                     graveyard: pl.graveyard.iter().map(|&c| self.card_view(c)).collect(),
                     exile: pl.exile.iter().map(|&c| self.card_view(c)).collect(),
+                    emblems: pl
+                        .emblems
+                        .iter()
+                        .map(|e| format!("{}.", e.boost.describe(false)))
+                        .collect(),
                     lost: pl.lost,
                 })
                 .collect(),
@@ -489,7 +558,7 @@ impl Game {
             battlefield: self
                 .battlefield
                 .iter()
-                .map(|&id| self.permanent_view(id))
+                .map(|&id| self.permanent_view(&sources, id))
                 .collect(),
             stack: self
                 .stack
@@ -529,12 +598,27 @@ impl Game {
             Pending::Discard(q, count) if q == p => Prompt::Discard { count },
             Pending::Choose(q) if q == p => {
                 let choosing = self.choosing.as_ref().expect("a choice is pending");
-                let def = self.objects[&choosing.item.source].def;
-                let what = self.item_effects(&choosing.item)[choosing.effect].describe();
-                Prompt::ChooseCard {
-                    reason: format!("{}: {what}", def.name),
-                    options: choosing.options.clone(),
-                    optional: true,
+                let reason = match &choosing.why {
+                    ChoiceFor::Resolving { item, effect } => format!(
+                        "{}: {}",
+                        self.objects[&item.source].def.name,
+                        self.item_effects(item)[*effect].describe()
+                    ),
+                    ChoiceFor::LegendRule { .. } => format!(
+                        "Legend rule: you control more than one {}. Choose the one to keep; \
+                         the others go to the graveyard.",
+                        self.card_name(choosing.options[0])
+                    ),
+                };
+                Prompt::ChooseCards {
+                    reason,
+                    options: choosing
+                        .options
+                        .iter()
+                        .map(|&id| self.card_view(id))
+                        .collect(),
+                    min: choosing.min,
+                    max: choosing.max,
                 }
             }
             _ => Prompt::Waiting {
@@ -547,23 +631,41 @@ impl Game {
         CardView::new(id, self.objects[&id].def)
     }
 
-    fn permanent_view(&self, id: ObjectId) -> PermanentView {
+    fn permanent_view(&self, sources: &[BoostSource], id: ObjectId) -> PermanentView {
         let o = &self.objects[&id];
+        let boosts = self.boosts_from(sources, id);
+        let has = |k| o.def.has(k) || boosts.iter().any(|b| b.keyword == Some(k));
         PermanentView {
             card: self.card_view(id),
             controller: o.controller,
             owner: o.owner,
             tapped: o.tapped,
-            summoning_sick: o.sick && o.is_creature() && !o.has(Keyword::Haste),
+            summoning_sick: o.sick && o.is_creature() && !has(Keyword::Haste),
             damage: o.damage,
-            power: o.is_creature().then(|| o.power()),
-            toughness: o.is_creature().then(|| o.toughness()),
+            power: o.is_creature().then(|| {
+                o.def.power().unwrap_or(0)
+                    + o.power_mod
+                    + boosts.iter().map(|b| b.power).sum::<i32>()
+            }),
+            toughness: o.is_creature().then(|| {
+                o.def.toughness().unwrap_or(0)
+                    + o.toughness_mod
+                    + boosts.iter().map(|b| b.toughness).sum::<i32>()
+            }),
+            keywords: Keyword::ALL.into_iter().filter(|&k| has(k)).collect(),
+            loyalty: o.def.is_planeswalker().then(|| o.loyalty()),
             attacking: self
                 .combat
                 .attacks
                 .iter()
                 .find(|a| a.attacker == id)
                 .map(|a| a.defender),
+            attacking_planeswalker: self
+                .combat
+                .attacks
+                .iter()
+                .find(|a| a.attacker == id)
+                .and_then(|a| a.planeswalker),
             blocking: self
                 .combat
                 .blocks
@@ -604,6 +706,8 @@ impl Game {
                 toughness_mod: 0,
                 cast_from: None,
                 moves: 0,
+                counters: BTreeMap::new(),
+                loyalty_used: false,
             },
         );
         id
@@ -613,6 +717,97 @@ impl Game {
         let id = ObjectId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Everything that boosts creatures right now: the static abilities of
+    /// permanents on the battlefield, and every player's emblems. Usually
+    /// empty. Callers that ask about many creatures collect these once.
+    fn boost_sources(&self) -> Vec<BoostSource> {
+        let mut sources = Vec::new();
+        for &source in &self.battlefield {
+            let s = &self.objects[&source];
+            for ability in s.def.abilities {
+                if let (Some(boost), Ability::Static { other, .. }) = (ability.boost(), ability) {
+                    sources.push(BoostSource {
+                        controller: s.controller,
+                        source: Some(source),
+                        other: *other,
+                        boost,
+                    });
+                }
+            }
+        }
+        for (q, player) in self.players.iter().enumerate() {
+            if !player.lost {
+                sources.extend(player.emblems.iter().map(|e| BoostSource {
+                    controller: q,
+                    source: None,
+                    other: false,
+                    boost: e.boost,
+                }));
+            }
+        }
+        sources
+    }
+
+    /// The boosts among `sources` that apply to `id`. Only creatures on the
+    /// battlefield get any.
+    fn boosts_from(&self, sources: &[BoostSource], id: ObjectId) -> Vec<Boost> {
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let o = &self.objects[&id];
+        if o.zone != Zone::Battlefield || !o.is_creature() {
+            return Vec::new();
+        }
+        sources
+            .iter()
+            .filter(|s| !(s.other && s.source == Some(id)))
+            .filter(|s| match s.boost.whose {
+                Whose::Anyone => true,
+                Whose::You => s.controller == o.controller,
+                Whose::Opponent => s.controller != o.controller,
+            })
+            .map(|s| s.boost)
+            .collect()
+    }
+
+    /// Current power: printed, plus boosts, plus "until end of turn" changes.
+    fn power(&self, id: ObjectId) -> i32 {
+        self.power_from(&self.boost_sources(), id)
+    }
+
+    fn power_from(&self, sources: &[BoostSource], id: ObjectId) -> i32 {
+        let o = &self.objects[&id];
+        let boosts: i32 = self.boosts_from(sources, id).iter().map(|b| b.power).sum();
+        o.def.power().unwrap_or(0) + o.power_mod + boosts
+    }
+
+    fn toughness(&self, id: ObjectId) -> i32 {
+        self.toughness_from(&self.boost_sources(), id)
+    }
+
+    fn toughness_from(&self, sources: &[BoostSource], id: ObjectId) -> i32 {
+        let o = &self.objects[&id];
+        let boosts: i32 = self
+            .boosts_from(sources, id)
+            .iter()
+            .map(|b| b.toughness)
+            .sum();
+        o.def.toughness().unwrap_or(0) + o.toughness_mod + boosts
+    }
+
+    /// Printed, or granted by a static ability or emblem.
+    fn has_keyword(&self, id: ObjectId, keyword: Keyword) -> bool {
+        self.has_keyword_from(&self.boost_sources(), id, keyword)
+    }
+
+    fn has_keyword_from(&self, sources: &[BoostSource], id: ObjectId, keyword: Keyword) -> bool {
+        self.objects[&id].def.has(keyword)
+            || self
+                .boosts_from(sources, id)
+                .iter()
+                .any(|b| b.keyword == Some(keyword))
     }
 
     fn on_battlefield(&self, id: ObjectId) -> bool {
@@ -674,6 +869,15 @@ impl Game {
         if !(from == Zone::Stack && zone == Zone::Battlefield) {
             o.cast_from = None;
         }
+        // A planeswalker enters with its printed loyalty; counters don't
+        // follow a card anywhere else.
+        o.counters.clear();
+        o.loyalty_used = false;
+        if zone == Zone::Battlefield
+            && let Some(loyalty) = o.def.loyalty()
+        {
+            o.counters.insert(Counter::Loyalty, loyalty);
+        }
         o.moves += 1;
     }
 
@@ -717,6 +921,7 @@ impl Game {
                 o.tapped = false;
                 o.sick = false;
             }
+            o.loyalty_used = false;
         }
         self.enter_step(Step::Upkeep);
     }
@@ -864,9 +1069,12 @@ impl Game {
                 }
                 Pending::Blockers(p) if self.players[p].lost => self.next_blocker(),
                 Pending::Choose(p) if self.players[p].lost => {
-                    // Its controller left the game, and their spell with them.
+                    // The chooser left the game, and their cards with them.
                     let choosing = self.choosing.take().expect("a choice is pending");
-                    self.finish_resolving(choosing.item.id);
+                    match choosing.why {
+                        ChoiceFor::Resolving { item, .. } => self.finish_resolving(item.id),
+                        ChoiceFor::LegendRule { resume } => self.pending = resume,
+                    }
                 }
                 _ => return,
             }
@@ -879,14 +1087,24 @@ impl Game {
             return;
         }
         loop {
+            let sources = self.boost_sources();
             let dying: Vec<ObjectId> = self
+                .battlefield
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let o = &self.objects[&id];
+                    let toughness = self.toughness_from(&sources, id);
+                    o.is_creature() && (toughness <= 0 || o.damage >= toughness || o.deathtouched)
+                })
+                .collect();
+            let out_of_loyalty: Vec<ObjectId> = self
                 .battlefield
                 .iter()
                 .copied()
                 .filter(|id| {
                     let o = &self.objects[id];
-                    o.is_creature()
-                        && (o.toughness() <= 0 || o.damage >= o.toughness() || o.deathtouched)
+                    o.def.is_planeswalker() && o.loyalty() <= 0
                 })
                 .collect();
             let losing: Vec<(PlayerId, &str)> = self
@@ -902,16 +1120,33 @@ impl Game {
                     }
                 })
                 .collect();
-            if dying.is_empty() && losing.is_empty() {
+            if dying.is_empty() && out_of_loyalty.is_empty() && losing.is_empty() {
                 break;
             }
             for id in dying {
                 self.log(format!("{} dies.", self.card_name(id)));
                 self.move_to(id, Zone::Graveyard);
             }
+            for id in out_of_loyalty {
+                self.log(format!("{} has no loyalty left.", self.card_name(id)));
+                self.move_to(id, Zone::Graveyard);
+            }
             for (p, why) in losing {
                 self.lose(p, why);
             }
+        }
+        if self.choosing.is_none()
+            && let Some((p, options)) = self.legend_conflict()
+        {
+            self.choosing = Some(Choosing {
+                options,
+                min: 1,
+                max: 1,
+                why: ChoiceFor::LegendRule {
+                    resume: self.pending,
+                },
+            });
+            self.pending = Pending::Choose(p);
         }
         let living: Vec<PlayerId> = self.living().collect();
         if living.len() <= 1 {
@@ -922,6 +1157,30 @@ impl Game {
             }
             self.pending = Pending::GameOver(winner);
         }
+    }
+
+    /// A player controlling two or more legendary permanents with the same
+    /// name, and those permanents: they must keep one (the legend rule).
+    fn legend_conflict(&self) -> Option<(PlayerId, Vec<ObjectId>)> {
+        // This runs every time the game settles, and usually there are no
+        // legendary permanents at all (collecting none doesn't allocate).
+        let legendary: Vec<ObjectId> = self
+            .battlefield
+            .iter()
+            .copied()
+            .filter(|id| self.objects[id].def.is_legendary())
+            .collect();
+        if legendary.len() < 2 {
+            return None;
+        }
+        let mut seen: BTreeMap<(PlayerId, &str), Vec<ObjectId>> = BTreeMap::new();
+        for id in legendary {
+            let o = &self.objects[&id];
+            seen.entry((o.controller, o.def.name)).or_default().push(id);
+        }
+        seen.into_iter()
+            .find(|(_, ids)| ids.len() > 1)
+            .map(|((p, _), ids)| (p, ids))
     }
 
     fn lose(&mut self, p: PlayerId, why: &str) {
@@ -965,14 +1224,14 @@ impl Game {
                         card: id,
                         kind: PlayKind::Land,
                         targets: None,
+                        cost: String::new(),
+                        way: None,
+                        ability: None,
                     });
                 }
                 continue;
             }
             if !def.is_instant() && !sorcery_speed {
-                continue;
-            }
-            if plan_payment(&self.cast_cost(id), &lands).is_none() {
                 continue;
             }
             let targets = match def.spell_target() {
@@ -985,13 +1244,109 @@ impl Game {
                     Some(targets)
                 }
             };
-            plays.push(PlayOption {
-                card: id,
-                kind: PlayKind::Spell,
-                targets,
-            });
+            for way in self.cast_ways(id) {
+                let cost = self.way_cost(id, way.as_ref());
+                if plan_payment(&cost, &lands).is_some() {
+                    plays.push(PlayOption {
+                        card: id,
+                        kind: PlayKind::Spell,
+                        targets: targets.clone(),
+                        cost: cost.to_string(),
+                        way,
+                        ability: None,
+                    });
+                }
+            }
+        }
+        plays.extend(self.ability_plays(p, sorcery_speed, &lands));
+        plays
+    }
+
+    /// `p`'s activated abilities they could activate now.
+    fn ability_plays(
+        &self,
+        p: PlayerId,
+        sorcery_speed: bool,
+        lands: &[(ObjectId, Color)],
+    ) -> Vec<PlayOption> {
+        let mut plays = Vec::new();
+        for &id in &self.battlefield {
+            let o = &self.objects[&id];
+            if o.controller != p {
+                continue;
+            }
+            for (i, ability) in o.def.abilities.iter().enumerate() {
+                let Ability::Activated { cost, .. } = ability else {
+                    continue;
+                };
+                if !self.can_pay(id, cost, sorcery_speed, lands) {
+                    continue;
+                }
+                let targets = match ability.target() {
+                    None => None,
+                    Some(spec) => {
+                        let targets = self.valid_targets(spec, p);
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        Some(targets)
+                    }
+                };
+                plays.push(PlayOption {
+                    card: id,
+                    kind: PlayKind::Ability(i),
+                    targets,
+                    cost: cost.describe(),
+                    way: None,
+                    ability: Some(ability.describe()),
+                });
+            }
         }
         plays
+    }
+
+    /// Every way to cast `card` from where it is: normally (`None`), plus,
+    /// from hand, each cast option with each different card its search
+    /// could find in the library.
+    fn cast_ways(&self, card: ObjectId) -> Vec<Option<CastWay>> {
+        let o = &self.objects[&card];
+        let mut ways = vec![None];
+        if o.zone != Zone::Hand {
+            return ways;
+        }
+        for (option, cast_option) in o.def.cast_options.iter().enumerate() {
+            let Some(filter) = cast_option.action.search_filter() else {
+                continue;
+            };
+            let mut found: Vec<&'static CardDef> = self.players[o.owner]
+                .library
+                .iter()
+                .map(|id| self.objects[id].def)
+                .filter(|def| filter.matches(def))
+                .collect();
+            found.sort_by_key(|def| def.key);
+            found.dedup_by_key(|def| def.key);
+            ways.extend(found.into_iter().map(|def| {
+                Some(CastWay {
+                    option,
+                    fetch: def.key.to_string(),
+                    fetch_name: def.name.to_string(),
+                })
+            }));
+        }
+        ways
+    }
+
+    /// What casting `card` the given way costs.
+    fn way_cost(&self, card: ObjectId, way: Option<&CastWay>) -> ManaCost {
+        let cost = self.cast_cost(card);
+        match way {
+            None => cost,
+            Some(way) => {
+                let option = &self.objects[&card].def.cast_options[way.option];
+                cost.reduce(&ManaCost::parse(option.reduction))
+            }
+        }
     }
 
     /// Everything a spell controlled by `caster` that targets `spec` could target.
@@ -1008,15 +1363,20 @@ impl Game {
         if matches!(kind, TargetKind::Any | TargetKind::Player) {
             targets.extend(self.living().filter(|&p| allowed(p)).map(Target::Player));
         }
-        if matches!(kind, TargetKind::Any | TargetKind::Creature) {
-            targets.extend(
-                self.battlefield
-                    .iter()
-                    .filter(|id| self.objects[id].is_creature())
-                    .filter(|id| allowed(self.objects[id].controller))
-                    .map(|&id| Target::Permanent(id)),
-            );
-        }
+        // "Any target" means a creature, a player or a planeswalker.
+        let permanent_ok = |o: &Object| match kind {
+            TargetKind::Any => o.is_creature() || o.def.is_planeswalker(),
+            TargetKind::Creature => o.is_creature(),
+            TargetKind::Planeswalker => o.def.is_planeswalker(),
+            _ => false,
+        };
+        targets.extend(
+            self.battlefield
+                .iter()
+                .filter(|id| permanent_ok(&self.objects[id]))
+                .filter(|id| allowed(self.objects[id].controller))
+                .map(|&id| Target::Permanent(id)),
+        );
         if kind == TargetKind::Spell {
             targets.extend(
                 self.stack
@@ -1050,6 +1410,99 @@ impl Game {
             Target::Permanent(id) | Target::Spell(id) | Target::GraveyardCard(id) => {
                 self.card_name(id).to_string()
             }
+        }
+    }
+
+    /// Pays for and activates `card`'s activated ability `ability`, putting it
+    /// on the stack.
+    fn activate(
+        &mut self,
+        p: PlayerId,
+        card: ObjectId,
+        ability: usize,
+        target: Option<Target>,
+    ) -> Result<(), ActionError> {
+        let plays = self.legal_plays(p);
+        let Some(option) = plays
+            .iter()
+            .find(|o| o.card == card && o.kind == PlayKind::Ability(ability))
+        else {
+            return reject("you can't activate that now");
+        };
+        check_target(&option.targets, target)?;
+        let def = self.objects[&card].def;
+        let Ability::Activated { cost, .. } = def.abilities[ability] else {
+            unreachable!("legal_plays only offers activated abilities")
+        };
+        if let Some(mana) = cost.mana {
+            let lands = self.untapped_lands(p);
+            let lands: Vec<_> = lands.into_iter().filter(|(id, _)| *id != card).collect();
+            for land in plan_payment(&ManaCost::parse(mana), &lands).expect("affordability checked")
+            {
+                self.objects.get_mut(&land).expect("land exists").tapped = true;
+            }
+        }
+        let o = self.objects.get_mut(&card).expect("card exists");
+        if let Some(n) = cost.loyalty {
+            *o.counters.entry(Counter::Loyalty).or_default() += n;
+            o.loyalty_used = true;
+        }
+        if cost.tap {
+            o.tapped = true;
+        }
+        let id = self.fresh_id();
+        self.stack.push(StackItem {
+            id,
+            source: card,
+            controller: p,
+            kind: StackKind::Ability(ability),
+            target,
+            that_player: None,
+            target_moves: target
+                .and_then(Target::object)
+                .map(|id| self.objects[&id].moves),
+        });
+        let aim = target
+            .map(|t| format!(" targeting {}", self.describe_target(t)))
+            .unwrap_or_default();
+        self.log(format!(
+            "{} activates {}'s {} ability{aim}.",
+            self.name(p),
+            def.name,
+            cost.describe()
+        ));
+        self.passes = 0;
+        self.give_priority(p);
+        Ok(())
+    }
+
+    /// Whether `id`'s controller could pay `cost` now: loyalty abilities only
+    /// once per turn, when a sorcery could be cast, and without going below
+    /// zero; {T} only if untapped (and, for a creature, not summoning sick).
+    fn can_pay(
+        &self,
+        id: ObjectId,
+        cost: &ActivationCost,
+        sorcery_speed: bool,
+        lands: &[(ObjectId, Color)],
+    ) -> bool {
+        let o = &self.objects[&id];
+        if let Some(n) = cost.loyalty
+            && (!sorcery_speed || o.loyalty_used || o.loyalty() + n < 0)
+        {
+            return false;
+        }
+        if cost.tap
+            && (o.tapped || (o.is_creature() && o.sick && !self.has_keyword(id, Keyword::Haste)))
+        {
+            return false;
+        }
+        match cost.mana {
+            Some(mana) => {
+                let lands: Vec<_> = lands.iter().copied().filter(|(l, _)| *l != id).collect();
+                plan_payment(&ManaCost::parse(mana), &lands).is_some()
+            }
+            None => true,
         }
     }
 
@@ -1095,28 +1548,24 @@ impl Game {
         p: PlayerId,
         card: ObjectId,
         target: Option<Target>,
+        way: Option<CastWay>,
     ) -> Result<(), ActionError> {
         let plays = self.legal_plays(p);
         let Some(option) = plays
             .iter()
-            .find(|o| o.card == card && o.kind == PlayKind::Spell)
+            .find(|o| o.card == card && o.kind == PlayKind::Spell && o.way == way)
         else {
             return reject("you can't cast that now");
         };
-        match (&option.targets, target) {
-            (None, None) => {}
-            (Some(valid), Some(t)) if valid.contains(&t) => {}
-            (Some(_), None) => return reject("that spell needs a target"),
-            (None, Some(_)) => return reject("that spell doesn't take a target"),
-            (Some(_), Some(_)) => return reject("that isn't a legal target"),
-        }
+        check_target(&option.targets, target)?;
         let def = self.objects[&card].def;
         let from = match self.objects[&card].zone {
             Zone::Graveyard => CastZone::Graveyard,
             _ => CastZone::Hand,
         };
-        let lands = plan_payment(&self.cast_cost(card), &self.untapped_lands(p))
-            .expect("affordability was checked");
+        let cost = self.way_cost(card, way.as_ref());
+        let lands =
+            plan_payment(&cost, &self.untapped_lands(p)).expect("affordability was checked");
         for land in lands {
             self.objects.get_mut(&land).expect("land exists").tapped = true;
         }
@@ -1136,7 +1585,27 @@ impl Game {
         let aim = target
             .map(|t| format!(" targeting {}", self.describe_target(t)))
             .unwrap_or_default();
-        self.log(format!("{} casts {}{aim}.", self.name(p), def.name));
+        let bringing = way
+            .as_ref()
+            .map(|w| format!(", bringing {}", w.fetch_name))
+            .unwrap_or_default();
+        self.log(format!(
+            "{} casts {}{aim}{bringing}.",
+            self.name(p),
+            def.name
+        ));
+        if let Some(way) = &way {
+            // The cast option's search. Its cost reduction was already
+            // applied, and affordability never counted what it finds.
+            let action = &def.cast_options[way.option].action;
+            let found = self.players[p]
+                .library
+                .iter()
+                .copied()
+                .find(|id| self.objects[id].def.key == way.fetch)
+                .expect("cast_ways only offers cards in the library");
+            self.finish_choice(p, action, vec![found]);
+        }
         self.passes = 0;
         self.give_priority(p);
         Ok(())
@@ -1144,7 +1613,11 @@ impl Game {
 
     fn resolve(&mut self, item: StackItem) {
         let def = self.objects[&item.source].def;
-        if let (Some(target), Some(kind)) = (item.target, def.spell_target())
+        let spec = match item.kind {
+            StackKind::Spell => def.spell_target(),
+            StackKind::Ability(i) => def.abilities[i].target(),
+        };
+        if let (Some(target), Some(kind)) = (item.target, spec)
             && !self.target_still_legal(&item, kind, target)
         {
             self.log(format!("{} fizzles: its target is gone.", def.name));
@@ -1153,7 +1626,7 @@ impl Game {
             }
             return;
         }
-        if item.is_spell() && def.is_creature() {
+        if item.is_spell() && def.is_permanent() {
             self.move_to(item.id, Zone::Battlefield);
             self.objects
                 .get_mut(&item.id)
@@ -1166,7 +1639,10 @@ impl Game {
         match item.kind {
             StackKind::Spell => {}
             StackKind::Ability(i) => {
-                let Ability::Triggered { only_if, .. } = def.abilities[i];
+                let only_if = match def.abilities[i] {
+                    Ability::Triggered { only_if, .. } => only_if,
+                    _ => None,
+                };
                 // Checked again on resolution. If the source has left the
                 // battlefield, go by how it was when it triggered, as the
                 // real rules do ("last known information").
@@ -1191,10 +1667,7 @@ impl Game {
         let def = self.objects[&item.source].def;
         match item.kind {
             StackKind::Spell => def.effects,
-            StackKind::Ability(i) => {
-                let Ability::Triggered { effects, .. } = def.abilities[i];
-                effects
-            }
+            StackKind::Ability(i) => def.abilities[i].effects(),
         }
     }
 
@@ -1204,33 +1677,125 @@ impl Game {
     fn apply_effects(&mut self, item: StackItem, from: usize) {
         let effects = self.item_effects(&item);
         for (i, effect) in effects.iter().enumerate().skip(from) {
-            if *effect == Effect::PutFromHand {
-                let options: Vec<ObjectId> = self.players[item.controller]
-                    .hand
-                    .iter()
-                    .copied()
-                    .filter(|id| self.objects[id].is_creature())
-                    .collect();
-                if !options.is_empty() {
-                    self.pending = Pending::Choose(item.controller);
-                    self.choosing = Some(Choosing {
-                        item,
-                        effect: i,
-                        options,
-                    });
-                    return;
+            if let Some(options) = self.choice_options(effect, item.controller) {
+                if options.is_empty() {
+                    self.finish_choice(item.controller, effect, Vec::new());
+                    continue;
                 }
-                let name = self.name(item.controller).to_string();
-                self.log(format!(
-                    "{name} has no creature card to put onto the battlefield."
-                ));
-                continue;
+                let max = match effect {
+                    Effect::Search { count, .. } => *count as usize,
+                    _ => 1,
+                };
+                self.pending = Pending::Choose(item.controller);
+                self.choosing = Some(Choosing {
+                    options,
+                    min: 0,
+                    max,
+                    why: ChoiceFor::Resolving { item, effect: i },
+                });
+                return;
             }
-            self.apply_effect(*effect, &item);
+            self.apply_effect(effect.clone(), &item);
         }
         if item.is_spell() {
             self.spell_done(item.id);
         }
+    }
+
+    /// For an effect that has its controller choose cards as it resolves, the
+    /// cards they may choose from; `None` for every other effect.
+    fn choice_options(&self, effect: &Effect, p: PlayerId) -> Option<Vec<ObjectId>> {
+        let player = &self.players[p];
+        let mut options: Vec<ObjectId> = match effect {
+            Effect::PutFromHand => player
+                .hand
+                .iter()
+                .copied()
+                .filter(|id| self.objects[id].is_creature())
+                .collect(),
+            Effect::Search { .. } => {
+                let filter = effect.search_filter().expect("a search");
+                player
+                    .library
+                    .iter()
+                    .copied()
+                    .filter(|id| filter.matches(self.objects[id].def))
+                    .collect()
+            }
+            _ => return None,
+        };
+        // Listed by name, not in library order, which they mustn't learn.
+        options.sort_by_key(|id| (self.objects[id].def.name, *id));
+        Some(options)
+    }
+
+    /// Carries out a choosing effect with the cards chosen (perhaps none).
+    fn finish_choice(&mut self, p: PlayerId, effect: &Effect, chosen: Vec<ObjectId>) {
+        let name = self.name(p).to_string();
+        match effect {
+            Effect::PutFromHand => match chosen.first() {
+                Some(&card) => self.put_onto_battlefield(card, p, false),
+                None => self.log(format!("{name} puts no creature onto the battlefield.")),
+            },
+            Effect::Search { to, tapped, .. } => {
+                let restricted = effect.search_filter().is_some_and(|f| f.is_restricted());
+                if chosen.is_empty() {
+                    self.log(format!("{name} searches their library and finds nothing."));
+                }
+                for &card in &chosen {
+                    match to {
+                        Destination::Hand => {
+                            // A search for a particular kind of card shows
+                            // what it found; a search for any card doesn't.
+                            let what = if restricted {
+                                format!("reveals {} and puts it", self.card_name(card))
+                            } else {
+                                "puts a card".to_string()
+                            };
+                            self.log(format!("{name} {what} into their hand."));
+                            self.move_to(card, Zone::Hand);
+                        }
+                        Destination::Battlefield => self.put_onto_battlefield(card, p, *tapped),
+                        Destination::TopOfLibrary => {}
+                    }
+                }
+                let library = &mut self.players[p].library;
+                library.retain(|id| !chosen.contains(id));
+                library.shuffle(&mut self.rng);
+                if *to == Destination::TopOfLibrary {
+                    // The first chosen card ends up on top (the end of the Vec).
+                    library.extend(chosen.iter().rev());
+                    let n = chosen.len();
+                    let cards = if n == 1 {
+                        "card".into()
+                    } else {
+                        format!("{n} cards")
+                    };
+                    self.log(format!(
+                        "{name} shuffles their library and puts {} {cards} on top.",
+                        if n == 1 { "a" } else { "the" }
+                    ));
+                } else {
+                    self.log(format!("{name} shuffles their library."));
+                }
+            }
+            _ => unreachable!("only choosing effects get here"),
+        }
+    }
+
+    /// Puts `card` onto the battlefield under `p`'s control without casting it.
+    fn put_onto_battlefield(&mut self, card: ObjectId, p: PlayerId, tapped: bool) {
+        self.move_to(card, Zone::Battlefield);
+        let o = self.objects.get_mut(&card).expect("card exists");
+        o.controller = p;
+        o.tapped = tapped;
+        let state = if tapped { " tapped" } else { "" };
+        self.log(format!(
+            "{} puts {} onto the battlefield{state}.",
+            self.name(p),
+            self.card_name(card)
+        ));
+        self.fire(Event::Entered(card));
     }
 
     /// Takes a finished item off the stack and gives the active player priority.
@@ -1240,31 +1805,45 @@ impl Game {
         self.give_priority(self.active);
     }
 
-    fn choose(&mut self, p: PlayerId, card: Option<ObjectId>) -> Result<(), ActionError> {
+    fn choose(&mut self, p: PlayerId, cards: Vec<ObjectId>) -> Result<(), ActionError> {
         let choosing = self.choosing.as_ref().expect("a choice is pending");
-        if let Some(card) = card
-            && !choosing.options.contains(&card)
-        {
+        let unique: HashSet<_> = cards.iter().collect();
+        if unique.len() != cards.len() {
+            return reject("choose each card only once");
+        }
+        if cards.len() > choosing.max {
+            return reject(format!("choose at most {}", choosing.max));
+        }
+        if cards.len() < choosing.min {
+            return reject(format!("choose at least {}", choosing.min));
+        }
+        if !cards.iter().all(|c| choosing.options.contains(c)) {
             return reject("you can't choose that card");
         }
-        let Choosing { item, effect, .. } = self.choosing.take().expect("a choice is pending");
-        match card {
-            Some(card) => {
-                self.move_to(card, Zone::Battlefield);
-                self.objects.get_mut(&card).expect("card exists").controller = p;
-                self.log(format!(
-                    "{} puts {} onto the battlefield.",
-                    self.name(p),
-                    self.card_name(card)
-                ));
-                self.fire(Event::Entered(card));
+        let Choosing { options, why, .. } = self.choosing.take().expect("a choice is pending");
+        match why {
+            ChoiceFor::Resolving { item, effect } => {
+                if cards.is_empty() {
+                    self.log(format!("{} chooses nothing.", self.name(p)));
+                }
+                let what = &self.item_effects(&item)[effect];
+                self.finish_choice(p, what, cards);
+                let id = item.id;
+                self.apply_effects(item, effect + 1);
+                if self.choosing.is_none() {
+                    self.finish_resolving(id);
+                }
             }
-            None => self.log(format!("{} chooses nothing.", self.name(p))),
-        }
-        let id = item.id;
-        self.apply_effects(item, effect + 1);
-        if self.choosing.is_none() {
-            self.finish_resolving(id);
+            ChoiceFor::LegendRule { resume } => {
+                for id in options.into_iter().filter(|id| !cards.contains(id)) {
+                    self.log(format!(
+                        "{} is put into the graveyard (legend rule).",
+                        self.card_name(id)
+                    ));
+                    self.move_to(id, Zone::Graveyard);
+                }
+                self.pending = resume;
+            }
         }
         Ok(())
     }
@@ -1275,7 +1854,9 @@ impl Game {
         for &id in &self.battlefield {
             let o = &self.objects[&id];
             for (i, ability) in o.def.abilities.iter().enumerate() {
-                let Ability::Triggered { when, only_if, .. } = *ability;
+                let Ability::Triggered { when, only_if, .. } = *ability else {
+                    continue;
+                };
                 let that_player = match (when, event) {
                     (Trigger::Enters, Event::Entered(entered)) if entered == id => None,
                     (
@@ -1391,7 +1972,18 @@ impl Game {
                     self.fire(Event::Entered(id));
                 }
             }
-            Effect::PutFromHand => unreachable!("handled by apply_effects"),
+            Effect::PutFromHand | Effect::Search { .. } => {
+                unreachable!("handled by apply_effects")
+            }
+            Effect::Emblem { .. } => {
+                let boost = effect.emblem().expect("an emblem");
+                self.players[controller].emblems.push(Emblem { boost });
+                self.log(format!(
+                    "{} gets an emblem with \"{}.\"",
+                    self.name(controller),
+                    boost.describe(false)
+                ));
+            }
             Effect::Bounce { .. } => {
                 if let Some(Target::Permanent(id)) = target {
                     let owner = self.objects[&id].owner;
@@ -1487,8 +2079,8 @@ impl Game {
         let src = &self.objects[&source];
         let (src_name, deathtouch, lifelink, src_controller) = (
             src.def.name,
-            src.has(Keyword::Deathtouch),
-            src.has(Keyword::Lifelink),
+            self.has_keyword(source, Keyword::Deathtouch),
+            self.has_keyword(source, Keyword::Lifelink),
             src.controller,
         );
         match target {
@@ -1507,8 +2099,13 @@ impl Game {
                     return;
                 }
                 let o = self.objects.get_mut(&id).expect("object exists");
-                o.damage += amount;
-                o.deathtouched |= deathtouch;
+                if o.def.is_planeswalker() {
+                    // Damage to a planeswalker removes that much loyalty.
+                    *o.counters.entry(Counter::Loyalty).or_default() -= amount;
+                } else {
+                    o.damage += amount;
+                    o.deathtouched |= deathtouch;
+                }
                 let name = o.def.name;
                 self.log(format!("{src_name} deals {amount} damage to {name}."));
             }
@@ -1528,33 +2125,48 @@ impl Game {
 
     fn attack_options(&self) -> Vec<AttackOption> {
         let p = self.active;
+        let sources = self.boost_sources();
         let defenders: Vec<PlayerId> = self.living().filter(|&q| q != p).collect();
-        self.battlefield
+        let planeswalkers: Vec<ObjectId> = self
+            .battlefield
             .iter()
+            .copied()
             .filter(|id| {
                 let o = &self.objects[id];
+                o.def.is_planeswalker() && defenders.contains(&o.controller)
+            })
+            .collect();
+        self.battlefield
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let o = &self.objects[&id];
                 o.is_creature()
                     && o.controller == p
                     && !o.tapped
-                    && (!o.sick || o.has(Keyword::Haste))
-                    && !o.has(Keyword::Defender)
+                    && (!o.sick || self.has_keyword_from(&sources, id, Keyword::Haste))
+                    && !self.has_keyword_from(&sources, id, Keyword::Defender)
             })
-            .map(|&attacker| AttackOption {
+            .map(|attacker| AttackOption {
                 attacker,
                 defenders: defenders.clone(),
+                planeswalkers: planeswalkers.clone(),
             })
             .collect()
     }
 
-    fn can_block(&self, blocker: ObjectId, attacker: ObjectId) -> bool {
+    fn can_block(&self, sources: &[BoostSource], blocker: ObjectId, attacker: ObjectId) -> bool {
         let b = &self.objects[&blocker];
-        let a = &self.objects[&attacker];
+        let has = |id, k| self.has_keyword_from(sources, id, k);
         b.is_creature()
             && !b.tapped
-            && (!a.has(Keyword::Flying) || b.has(Keyword::Flying) || b.has(Keyword::Reach))
+            && (!has(attacker, Keyword::Flying)
+                || has(blocker, Keyword::Flying)
+                || has(blocker, Keyword::Reach))
     }
 
     fn block_options(&self, defender: PlayerId) -> Vec<BlockOption> {
+        let sources = self.boost_sources();
         let attackers: Vec<ObjectId> = self
             .combat
             .attacks
@@ -1569,7 +2181,7 @@ impl Game {
                 let can: Vec<ObjectId> = attackers
                     .iter()
                     .copied()
-                    .filter(|&a| self.can_block(blocker, a))
+                    .filter(|&a| self.can_block(&sources, blocker, a))
                     .collect();
                 (!can.is_empty()).then_some(BlockOption {
                     blocker,
@@ -1589,6 +2201,12 @@ impl Game {
             if !option.defenders.contains(&attack.defender) {
                 return reject("you can't attack that player");
             }
+            if let Some(pw) = attack.planeswalker
+                && (!option.planeswalkers.contains(&pw)
+                    || self.objects[&pw].controller != attack.defender)
+            {
+                return reject("you can't attack that planeswalker");
+            }
             if !seen.insert(attack.attacker) {
                 return reject("a creature can only attack once");
             }
@@ -1600,17 +2218,19 @@ impl Game {
             return Ok(());
         }
         for attack in &attacks {
-            let o = self
-                .objects
-                .get_mut(&attack.attacker)
-                .expect("attacker exists");
-            if !o.has(Keyword::Vigilance) {
-                o.tapped = true;
+            if !self.has_keyword(attack.attacker, Keyword::Vigilance) {
+                self.objects
+                    .get_mut(&attack.attacker)
+                    .expect("attacker exists")
+                    .tapped = true;
             }
+            let whom = match attack.planeswalker {
+                Some(pw) => self.card_name(pw).to_string(),
+                None => self.name(attack.defender).to_string(),
+            };
             self.log(format!(
-                "{} attacks {}.",
-                self.card_name(attack.attacker),
-                self.name(attack.defender)
+                "{} attacks {whom}.",
+                self.card_name(attack.attacker)
             ));
         }
         self.combat.attacks = attacks;
@@ -1665,13 +2285,20 @@ impl Game {
             if !self.on_battlefield(attack.attacker) {
                 continue;
             }
-            let attacker = &self.objects[&attack.attacker];
+            let power = self.power(attack.attacker);
             if !self.combat.blocked.contains(&attack.attacker) {
-                hits.push((
-                    attack.attacker,
-                    Target::Player(attack.defender),
-                    attacker.power(),
-                ));
+                match attack.planeswalker {
+                    // A planeswalker that's gone (or changed sides) takes no
+                    // damage, and the attacker deals none elsewhere.
+                    Some(pw) => {
+                        if self.on_battlefield(pw)
+                            && self.objects[&pw].controller == attack.defender
+                        {
+                            hits.push((attack.attacker, Target::Permanent(pw), power));
+                        }
+                    }
+                    None => hits.push((attack.attacker, Target::Player(attack.defender), power)),
+                }
                 continue;
             }
             let blockers: Vec<ObjectId> = self
@@ -1683,13 +2310,12 @@ impl Game {
                 .collect();
             // The attacker assigns lethal damage to each blocker in order, with
             // anything left over going to the last one.
-            let mut remaining = attacker.power().max(0);
+            let mut remaining = power.max(0);
             for (i, &blocker) in blockers.iter().enumerate() {
-                let b = &self.objects[&blocker];
-                let lethal = if attacker.has(Keyword::Deathtouch) {
+                let lethal = if self.has_keyword(attack.attacker, Keyword::Deathtouch) {
                     1
                 } else {
-                    (b.toughness() - b.damage).max(1)
+                    (self.toughness(blocker) - self.objects[&blocker].damage).max(1)
                 };
                 let assigned = if i + 1 == blockers.len() {
                     remaining
@@ -1698,7 +2324,11 @@ impl Game {
                 };
                 remaining -= assigned;
                 hits.push((attack.attacker, Target::Permanent(blocker), assigned));
-                hits.push((blocker, Target::Permanent(attack.attacker), b.power()));
+                hits.push((
+                    blocker,
+                    Target::Permanent(attack.attacker),
+                    self.power(blocker),
+                ));
             }
         }
         for (source, target, amount) in hits {
@@ -1735,7 +2365,10 @@ impl Game {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use crate::cards::{self, DECKS};
+    use crate::view::PlayKind;
 
     /// A game with empty hands and battlefields on player 0's first main phase.
     fn blank_game() -> Game {
@@ -1805,6 +2438,7 @@ mod tests {
             Action::Cast {
                 card: bolt,
                 target: Some(Target::Permanent(bear)),
+                way: None,
             },
         )
         .unwrap();
@@ -1825,6 +2459,7 @@ mod tests {
             Action::Cast {
                 card: bolt,
                 target: Some(Target::Player(1)),
+                way: None,
             },
         )
         .unwrap();
@@ -1835,6 +2470,7 @@ mod tests {
             Action::Cast {
                 card: counter,
                 target: Some(Target::Spell(bolt)),
+                way: None,
             },
         )
         .unwrap();
@@ -1856,6 +2492,7 @@ mod tests {
             Action::Cast {
                 card: bolt,
                 target: Some(Target::Permanent(drake)),
+                way: None,
             },
         )
         .unwrap();
@@ -1864,6 +2501,7 @@ mod tests {
             Action::Cast {
                 card: bounce,
                 target: Some(Target::Permanent(drake)),
+                way: None,
             },
         )
         .unwrap();
@@ -1886,6 +2524,7 @@ mod tests {
                 attacks: vec![Attack {
                     attacker: drake,
                     defender: 1,
+                    planeswalker: None,
                 }],
             },
         )
@@ -1922,10 +2561,12 @@ mod tests {
             Attack {
                 attacker: leech,
                 defender: 1,
+                planeswalker: None,
             },
             Attack {
                 attacker: boar,
                 defender: 1,
+                planeswalker: None,
             },
         ];
         g.apply(0, Action::DeclareAttackers { attacks }).unwrap();
@@ -1962,6 +2603,7 @@ mod tests {
             Action::Cast {
                 card: hound,
                 target: None,
+                way: None,
             },
         )
         .unwrap();
@@ -1985,6 +2627,9 @@ mod tests {
             keywords: &[],
             effects: &[],
             flashback: None,
+            flavor: None,
+            cast_options: &[],
+            legendary: false,
             abilities: &[
                 Ability::Triggered {
                     when: Trigger::Enters,
@@ -2008,7 +2653,15 @@ mod tests {
         lands(&mut g, 0, "meadow", 1);
         let card = g.create(&TWO_TRIGGERS, 0, Zone::Hand);
         g.players[0].hand.push(card);
-        g.apply(0, Action::Cast { card, target: None }).unwrap();
+        g.apply(
+            0,
+            Action::Cast {
+                card,
+                target: None,
+                way: None,
+            },
+        )
+        .unwrap();
         pass_until(&mut g, |g| g.stack.is_empty());
         assert_eq!(g.objects[&card].zone, Zone::Battlefield);
         assert_eq!(g.players[0].life, 23);
@@ -2033,7 +2686,15 @@ mod tests {
     fn cast_from_hand(g: &mut Game, p: PlayerId, def: &'static CardDef) -> ObjectId {
         let card = g.create(def, p, Zone::Hand);
         g.players[p].hand.push(card);
-        g.apply(p, Action::Cast { card, target: None }).unwrap();
+        g.apply(
+            p,
+            Action::Cast {
+                card,
+                target: None,
+                way: None,
+            },
+        )
+        .unwrap();
         card
     }
 
@@ -2103,6 +2764,7 @@ mod tests {
             Action::Cast {
                 card: veilstep,
                 target: Some(Target::Permanent(tyrant)),
+                way: None,
             },
         )
         .unwrap();
@@ -2119,6 +2781,7 @@ mod tests {
         let attacks = vec![Attack {
             attacker: tyrant,
             defender: 1,
+            planeswalker: None,
         }];
         g.apply(0, Action::DeclareAttackers { attacks }).unwrap();
         if let Some(blocker) = blocker {
@@ -2169,6 +2832,7 @@ mod tests {
             Action::Cast {
                 card,
                 target: Some(target),
+                way: None,
             },
         )
         .unwrap();
@@ -2294,6 +2958,7 @@ mod tests {
             Action::Cast {
                 card: veilstep,
                 target: Some(Target::Permanent(pilgrim)),
+                way: None,
             },
         )
         .unwrap();
@@ -2340,6 +3005,7 @@ mod tests {
             Action::Cast {
                 card: spark,
                 target: Some(Target::Player(1)),
+                way: None,
             },
         )
         .unwrap();
@@ -2367,6 +3033,7 @@ mod tests {
             Action::Cast {
                 card: counter,
                 target: Some(Target::Spell(spark)),
+                way: None,
             },
         )
         .unwrap();
@@ -2386,6 +3053,7 @@ mod tests {
             Action::Cast {
                 card: spark,
                 target: Some(Target::Player(1)),
+                way: None,
             },
         )
         .unwrap();
@@ -2395,6 +3063,7 @@ mod tests {
             Action::Cast {
                 card: counter,
                 target: Some(Target::Spell(spark)),
+                way: None,
             },
         )
         .unwrap();
@@ -2415,18 +3084,17 @@ mod tests {
             Action::Cast {
                 card: beckon,
                 target: None,
+                way: None,
             },
         )
         .unwrap();
         pass_until(&mut g, |g| g.pending == Pending::Choose(0));
-        let Prompt::ChooseCard {
-            options, optional, ..
-        } = g.view(0).prompt
-        else {
+        let Prompt::ChooseCards { options, max, .. } = g.view(0).prompt else {
             panic!("expected a choice");
         };
-        assert_eq!(options, [wraith], "only creature cards are offered");
-        assert!(optional);
+        let offered: Vec<_> = options.iter().map(|c| c.id).collect();
+        assert_eq!(offered, [wraith], "only creature cards are offered");
+        assert_eq!(max, 1);
         assert_eq!(
             g.stack.len(),
             1,
@@ -2437,13 +3105,23 @@ mod tests {
         assert_eq!(bob.prompt, Prompt::Waiting { on: 0 });
         assert!(!format!("{bob:?}").contains("Gravecall"));
         assert_eq!(
-            g.apply(0, Action::ChooseCard { card: Some(beckon) }),
+            g.apply(
+                0,
+                Action::ChooseCards {
+                    cards: vec![beckon]
+                }
+            ),
             Err(ActionError("you can't choose that card".into()))
         );
 
         let hand = g.players[0].hand.len();
-        g.apply(0, Action::ChooseCard { card: Some(wraith) })
-            .unwrap();
+        g.apply(
+            0,
+            Action::ChooseCards {
+                cards: vec![wraith],
+            },
+        )
+        .unwrap();
         pass_until(&mut g, |g| g.stack.is_empty());
         assert!(g.on_battlefield(wraith));
         assert_eq!(g.objects[&beckon].zone, Zone::Graveyard);
@@ -2461,7 +3139,7 @@ mod tests {
         let boar = put(&mut g, 0, "thornback-boar", Zone::Hand);
         cast_from_hand(&mut g, 0, cards::card("beckon-the-wild").unwrap());
         pass_until(&mut g, |g| g.pending == Pending::Choose(0));
-        g.apply(0, Action::ChooseCard { card: None }).unwrap();
+        g.apply(0, Action::ChooseCards { cards: vec![] }).unwrap();
         pass_until(&mut g, |g| g.stack.is_empty());
         assert_eq!(g.objects[&boar].zone, Zone::Hand);
 
@@ -2472,7 +3150,7 @@ mod tests {
         assert!(
             g.log
                 .iter()
-                .any(|l| l == "Ann has no creature card to put onto the battlefield.")
+                .any(|l| l == "Ann puts no creature onto the battlefield.")
         );
     }
 
@@ -2484,10 +3162,520 @@ mod tests {
         g.players[0].hand.push(tyrant);
         cast_from_hand(&mut g, 0, cards::card("beckon-the-wild").unwrap());
         pass_until(&mut g, |g| g.pending == Pending::Choose(0));
-        g.apply(0, Action::ChooseCard { card: Some(tyrant) })
-            .unwrap();
+        g.apply(
+            0,
+            Action::ChooseCards {
+                cards: vec![tyrant],
+            },
+        )
+        .unwrap();
         pass_until(&mut g, |g| g.is_over());
         assert_eq!(g.result(), Some(Some(1)));
+    }
+
+    /// A card from the sample pack (`tests/fixtures/sample-pack.toml`).
+    fn sample_card(key: &str) -> &'static CardDef {
+        static POOL: std::sync::OnceLock<CardPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let mut pool = CardPool::builtin();
+            let pack = toml::from_str(include_str!("../tests/fixtures/sample-pack.toml")).unwrap();
+            pool.add_pack(pack).unwrap();
+            pool
+        })
+        .card(key)
+        .unwrap()
+    }
+
+    /// Puts `n` copies of a card on top of `p`'s library.
+    fn in_library(g: &mut Game, p: PlayerId, key: &str, n: usize) -> Vec<ObjectId> {
+        (0..n)
+            .map(|_| {
+                let id = g.create(cards::card(key).unwrap(), p, Zone::Library);
+                g.players[p].library.push(id);
+                id
+            })
+            .collect()
+    }
+
+    /// Casts `def` from `p`'s hand and passes until it asks `p` to choose.
+    fn cast_until_choice(g: &mut Game, p: PlayerId, def: &'static CardDef) -> Prompt {
+        cast_from_hand(g, p, def);
+        pass_until(g, |g| g.pending == Pending::Choose(p));
+        g.view(p).prompt
+    }
+
+    #[test]
+    fn search_for_lands_reveals_them_and_shuffles() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "lagoon", 2);
+        let lagoons = in_library(&mut g, 0, "lagoon", 3);
+        let library = g.players[0].library.len();
+        let prompt = cast_until_choice(&mut g, 0, sample_card("chart-the-shoals"));
+        let Prompt::ChooseCards { options, max, .. } = prompt else {
+            panic!("{prompt:?}");
+        };
+        assert_eq!(max, 2);
+        let offered: BTreeSet<_> = options.iter().map(|c| c.id).collect();
+        assert_eq!(
+            offered,
+            lagoons.iter().copied().collect(),
+            "only lands that tap for {{U}}"
+        );
+        // Bob is told who's choosing, and nothing about Ann's library.
+        assert_eq!(g.view(1).prompt, Prompt::Waiting { on: 0 });
+
+        g.apply(
+            0,
+            Action::ChooseCards {
+                cards: lagoons[..2].to_vec(),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(lagoons[..2].iter().all(|id| g.players[0].hand.contains(id)));
+        assert_eq!(g.players[0].library.len(), library - 2);
+        let revealed = g
+            .log
+            .iter()
+            .filter(|l| *l == "Ann reveals Lagoon and puts it into their hand.");
+        assert_eq!(revealed.count(), 2);
+        assert!(g.log.iter().any(|l| l == "Ann shuffles their library."));
+    }
+
+    #[test]
+    fn a_search_for_any_card_keeps_it_secret() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 3);
+        let Prompt::ChooseCards { options, .. } =
+            cast_until_choice(&mut g, 0, sample_card("deep-recall"))
+        else {
+            panic!("expected a choice");
+        };
+        assert_eq!(
+            options.len(),
+            g.players[0].library.len(),
+            "any card will do"
+        );
+        let card = options[0].id;
+        g.apply(0, Action::ChooseCards { cards: vec![card] })
+            .unwrap();
+        assert!(g.players[0].hand.contains(&card));
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann puts a card into their hand.")
+        );
+        assert!(
+            !g.log
+                .iter()
+                .any(|l| l.contains(g.card_name(card)) && l.contains("hand"))
+        );
+    }
+
+    #[test]
+    fn stacking_the_deck_puts_the_first_choice_on_top() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "lagoon", 4);
+        let prompt = cast_until_choice(&mut g, 0, sample_card("tidal-archivist"));
+        let Prompt::ChooseCards { options, max, .. } = prompt else {
+            panic!("{prompt:?}");
+        };
+        assert_eq!(max, 2);
+        let (first, second) = (options[5].id, options[0].id);
+        assert_eq!(
+            g.apply(
+                0,
+                Action::ChooseCards {
+                    cards: vec![first, first]
+                }
+            ),
+            Err(ActionError("choose each card only once".into()))
+        );
+        g.apply(
+            0,
+            Action::ChooseCards {
+                cards: vec![first, second],
+            },
+        )
+        .unwrap();
+        let library = &g.players[0].library;
+        assert_eq!(library[library.len() - 1], first, "next draw");
+        assert_eq!(library[library.len() - 2], second, "the draw after");
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann shuffles their library and puts the 2 cards on top.")
+        );
+    }
+
+    #[test]
+    fn finding_nothing_still_shuffles() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "lagoon", 2);
+        // Ann's deck (Ember & Thorn) has no lands that tap for {U}.
+        cast_from_hand(&mut g, 0, sample_card("chart-the-shoals"));
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann searches their library and finds nothing.")
+        );
+        assert!(g.log.iter().any(|l| l == "Ann shuffles their library."));
+    }
+
+    #[test]
+    fn a_cast_option_fetches_a_land_and_costs_less() {
+        let herald = sample_card("mire-herald");
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 2);
+        lands(&mut g, 0, "crag", 1);
+        let card = g.create(herald, 0, Zone::Hand);
+        g.players[0].hand.push(card);
+        // {2}{B}{B} is too much for three lands, and there's no Bog to bring.
+        assert!(g.legal_plays(0).iter().all(|o| o.card != card));
+
+        in_library(&mut g, 0, "bog", 2);
+        let plays = g.legal_plays(0);
+        let ways: Vec<_> = plays.iter().filter(|o| o.card == card).collect();
+        assert_eq!(ways.len(), 1, "only the cheaper way is affordable");
+        assert_eq!(ways[0].cost, "{2}{B}");
+        let way = ways[0].way.clone().unwrap();
+        assert_eq!(
+            (way.fetch.as_str(), way.fetch_name.as_str()),
+            ("bog", "Bog")
+        );
+        assert_eq!(
+            herald.rules_text(),
+            "As you cast this spell, you may search your library for a land card that taps \
+             for {B}, put it onto the battlefield tapped, then shuffle. If you do, this spell \
+             costs {B} less to cast."
+        );
+
+        g.apply(
+            0,
+            Action::Cast {
+                card,
+                target: None,
+                way: Some(way),
+            },
+        )
+        .unwrap();
+        let bogs: Vec<_> = g
+            .battlefield
+            .iter()
+            .filter(|id| g.objects[id].def.key == "bog")
+            .collect();
+        assert_eq!(bogs.len(), 3, "it brought a Bog");
+        assert!(
+            bogs.iter().all(|id| g.objects[id].tapped),
+            "all paid for, or brought tapped"
+        );
+        assert_eq!(
+            g.players[0]
+                .library
+                .iter()
+                .filter(|id| g.objects[id].def.key == "bog")
+                .count(),
+            1
+        );
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann casts Mire Herald, bringing Bog.")
+        );
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(g.on_battlefield(card));
+    }
+
+    /// Puts a sample-pack card onto `p`'s battlefield, ready to use (not
+    /// summoning sick).
+    fn ready(g: &mut Game, p: PlayerId, key: &str) -> ObjectId {
+        let id = g.create(sample_card(key), p, Zone::Battlefield);
+        g.battlefield.push(id);
+        let o = g.objects.get_mut(&id).unwrap();
+        o.sick = false;
+        if let Some(loyalty) = o.def.loyalty() {
+            o.counters.insert(Counter::Loyalty, loyalty);
+        }
+        id
+    }
+
+    fn ability_plays(g: &Game, p: PlayerId, card: ObjectId) -> Vec<usize> {
+        g.legal_plays(p)
+            .iter()
+            .filter(|o| o.card == card)
+            .filter_map(|o| match o.kind {
+                PlayKind::Ability(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn activate(g: &mut Game, p: PlayerId, card: ObjectId, ability: usize, target: Option<Target>) {
+        g.apply(
+            p,
+            Action::Activate {
+                card,
+                ability,
+                target,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_lord_boosts_the_others_and_only_while_it_stays() {
+        let mut g = blank_game();
+        let captain = ready(&mut g, 0, "harbor-captain");
+        let grovekin = put(&mut g, 0, "grovekin", Zone::Battlefield);
+        let enemy = put(&mut g, 1, "grovekin", Zone::Battlefield);
+        assert_eq!(
+            (g.power(captain), g.toughness(captain)),
+            (2, 2),
+            "not itself"
+        );
+        assert_eq!((g.power(grovekin), g.toughness(grovekin)), (3, 3));
+        assert_eq!(g.power(enemy), 2, "only creatures you control");
+        let view = g.view(0);
+        assert_eq!(view.permanent(grovekin).unwrap().power, Some(3));
+        assert_eq!(
+            sample_card("harbor-captain").rules_text(),
+            "Other creatures you control get +1/+1."
+        );
+
+        // 2 damage doesn't kill a 3/3, but it does once the boost is gone.
+        g.objects.get_mut(&grovekin).unwrap().damage = 2;
+        g.check_state();
+        assert!(g.on_battlefield(grovekin));
+        g.move_to(captain, Zone::Graveyard);
+        g.check_state();
+        assert_eq!(g.objects[&grovekin].zone, Zone::Graveyard);
+    }
+
+    #[test]
+    fn planeswalkers_use_one_loyalty_ability_a_turn() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "lagoon", 2);
+        lands(&mut g, 0, "bog", 2);
+        // An instant Ann could still cast, so she keeps priority throughout.
+        lands(&mut g, 0, "meadow", 1);
+        put(&mut g, 0, "mending-light", Zone::Hand);
+        let ilsa = cast_from_hand(&mut g, 0, sample_card("ilsa-tide-warden"));
+        pass_until(&mut g, |g| g.stack.is_empty() && g.on_battlefield(ilsa));
+        assert_eq!(
+            g.objects[&ilsa].loyalty(),
+            4,
+            "enters with its printed loyalty"
+        );
+        assert_eq!(
+            sample_card("ilsa-tide-warden").type_line(),
+            "Legendary Planeswalker — Ilsa"
+        );
+        // +1 and −2 (no creature to target, so not offered yet); not −5.
+        assert_eq!(ability_plays(&g, 0, ilsa), [0]);
+        let bear = put(&mut g, 1, "grovekin", Zone::Battlefield);
+        assert_eq!(ability_plays(&g, 0, ilsa), [0, 1]);
+
+        let hand = g.players[0].hand.len();
+        activate(&mut g, 0, ilsa, 0, None);
+        assert_eq!(g.objects[&ilsa].loyalty(), 5, "the cost is paid at once");
+        assert!(ability_plays(&g, 0, ilsa).is_empty(), "one per turn");
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.players[0].hand.len(), hand + 1);
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann activates Ilsa, Tide Warden's +1 ability.")
+        );
+
+        // Next turn of Ann's, it can go again: −2 kills the creature.
+        g.objects.get_mut(&ilsa).unwrap().loyalty_used = false;
+        activate(&mut g, 0, ilsa, 1, Some(Target::Permanent(bear)));
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&bear].zone, Zone::Graveyard);
+        assert_eq!(g.objects[&ilsa].loyalty(), 3);
+        assert_eq!(
+            g.apply(
+                0,
+                Action::Activate {
+                    card: ilsa,
+                    ability: 0,
+                    target: None,
+                },
+            ),
+            Err(ActionError("you can't activate that now".into()))
+        );
+    }
+
+    #[test]
+    fn damage_to_a_planeswalker_removes_loyalty() {
+        let mut g = blank_game();
+        let ilsa = ready(&mut g, 1, "ilsa-tide-warden");
+        lands(&mut g, 0, "crag", 2);
+        let blaze = put(&mut g, 0, "blaze", Zone::Hand);
+        let targets = g
+            .legal_plays(0)
+            .into_iter()
+            .find(|o| o.card == blaze)
+            .unwrap()
+            .targets
+            .unwrap();
+        assert!(
+            targets.contains(&Target::Permanent(ilsa)),
+            "any target includes planeswalkers"
+        );
+        g.apply(
+            0,
+            Action::Cast {
+                card: blaze,
+                target: Some(Target::Permanent(ilsa)),
+                way: None,
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&ilsa].loyalty(), 1);
+        assert_eq!(g.objects[&ilsa].damage, 0, "loyalty, not damage");
+
+        g.deal_damage(blaze, Target::Permanent(ilsa), 1, false);
+        g.check_state();
+        assert_eq!(g.objects[&ilsa].zone, Zone::Graveyard);
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ilsa, Tide Warden has no loyalty left.")
+        );
+    }
+
+    #[test]
+    fn creatures_can_attack_planeswalkers() {
+        let mut g = blank_game();
+        let ilsa = ready(&mut g, 1, "ilsa-tide-warden");
+        let boar = put(&mut g, 0, "thornback-boar", Zone::Battlefield);
+        g.objects.get_mut(&boar).unwrap().sick = false;
+        pass_until(&mut g, |g| g.pending == Pending::Attackers(0));
+        let options = g.attack_options();
+        assert_eq!(options[0].planeswalkers, [ilsa]);
+        assert_eq!(
+            g.apply(
+                0,
+                Action::DeclareAttackers {
+                    attacks: vec![Attack {
+                        attacker: boar,
+                        defender: 0,
+                        planeswalker: Some(ilsa),
+                    }],
+                },
+            ),
+            Err(ActionError("you can't attack that player".into())),
+            "the defender is the planeswalker's controller"
+        );
+        g.apply(
+            0,
+            Action::DeclareAttackers {
+                attacks: vec![Attack {
+                    attacker: boar,
+                    defender: 1,
+                    planeswalker: Some(ilsa),
+                }],
+            },
+        )
+        .unwrap();
+        let power = g.power(boar);
+        pass_until(&mut g, |g| g.step == Step::Main2);
+        assert_eq!(g.players[1].life, STARTING_LIFE, "the player takes nothing");
+        assert_eq!(g.objects[&ilsa].loyalty(), (4 - power).max(0));
+    }
+
+    #[test]
+    fn an_emblem_boosts_for_the_rest_of_the_game() {
+        let mut g = blank_game();
+        let ilsa = ready(&mut g, 0, "ilsa-tide-warden");
+        g.objects
+            .get_mut(&ilsa)
+            .unwrap()
+            .counters
+            .insert(Counter::Loyalty, 5);
+        let bear = put(&mut g, 0, "grovekin", Zone::Battlefield);
+        activate(&mut g, 0, ilsa, 2, None);
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(
+            g.objects[&ilsa].zone,
+            Zone::Graveyard,
+            "used all its loyalty"
+        );
+        assert_eq!((g.power(bear), g.toughness(bear)), (4, 4));
+        assert!(g.has_keyword(bear, Keyword::Flying));
+        let view = g.view(1);
+        assert_eq!(
+            view.players[0].emblems,
+            ["Creatures you control get +2/+2 and have flying."]
+        );
+        assert!(
+            view.permanent(bear)
+                .unwrap()
+                .keywords
+                .contains(&Keyword::Flying)
+        );
+        // It applies to creatures that arrive later, too.
+        let later = put(&mut g, 0, "mossling", Zone::Battlefield);
+        assert_eq!(g.power(later), 3);
+    }
+
+    #[test]
+    fn the_legend_rule_keeps_the_one_you_choose() {
+        let mut g = blank_game();
+        let first = ready(&mut g, 0, "old-gull");
+        lands(&mut g, 0, "lagoon", 4);
+        let second = cast_from_hand(&mut g, 0, sample_card("old-gull"));
+        pass_until(&mut g, |g| g.pending == Pending::Choose(0));
+        let Prompt::ChooseCards {
+            options,
+            min,
+            max,
+            reason,
+        } = g.view(0).prompt
+        else {
+            panic!("expected the legend rule");
+        };
+        assert_eq!((min, max), (1, 1));
+        assert!(reason.starts_with("Legend rule"), "{reason}");
+        let ids: BTreeSet<_> = options.iter().map(|c| c.id).collect();
+        assert_eq!(ids, [first, second].into_iter().collect());
+        assert_eq!(
+            g.apply(0, Action::ChooseCards { cards: vec![] }),
+            Err(ActionError("choose at least 1".into()))
+        );
+        g.apply(
+            0,
+            Action::ChooseCards {
+                cards: vec![second],
+            },
+        )
+        .unwrap();
+        assert!(g.on_battlefield(second));
+        assert_eq!(g.objects[&first].zone, Zone::Graveyard);
+        assert!(matches!(g.pending, Pending::Priority(_)), "play carries on");
+    }
+
+    #[test]
+    fn tap_abilities_wait_out_summoning_sickness_and_cost_mana() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 1);
+        let sniper = ready(&mut g, 0, "reefshot-sniper");
+        g.objects.get_mut(&sniper).unwrap().sick = true;
+        assert!(ability_plays(&g, 0, sniper).is_empty(), "summoning sick");
+        g.objects.get_mut(&sniper).unwrap().sick = false;
+        assert_eq!(ability_plays(&g, 0, sniper), [0]);
+        assert_eq!(
+            sample_card("reefshot-sniper").rules_text(),
+            "{1}, {T}: Deal 1 damage to any target."
+        );
+        activate(&mut g, 0, sniper, 0, Some(Target::Player(1)));
+        assert!(g.objects[&sniper].tapped);
+        assert!(g.untapped_lands(0).is_empty(), "paid {{1}}");
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.players[1].life, STARTING_LIFE - 1);
     }
 
     #[test]

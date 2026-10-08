@@ -1,7 +1,7 @@
 //! Plays many games of random legal moves, using only what each player's view
 //! offers, and checks that every game finishes and no card is ever lost.
 
-use magus_core::view::Prompt;
+use magus_core::view::{PlayKind, Prompt};
 use magus_core::{Action, Attack, Block, CardPool, Game, GameView, Pack};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -14,17 +14,18 @@ fn random_action(view: &GameView, rng: &mut StdRng) -> Action {
                 return Action::Pass;
             }
             let play = plays.choose(rng).unwrap();
-            match &play.targets {
-                None if play.kind == magus_core::view::PlayKind::Land => {
-                    Action::PlayLand { card: play.card }
-                }
-                None => Action::Cast {
+            let target = play.targets.as_ref().map(|t| *t.choose(rng).unwrap());
+            match play.kind {
+                PlayKind::Land => Action::PlayLand { card: play.card },
+                PlayKind::Spell => Action::Cast {
                     card: play.card,
-                    target: None,
+                    target,
+                    way: play.way.clone(),
                 },
-                Some(targets) => Action::Cast {
+                PlayKind::Ability(ability) => Action::Activate {
                     card: play.card,
-                    target: Some(*targets.choose(rng).unwrap()),
+                    ability,
+                    target,
                 },
             }
         }
@@ -32,9 +33,20 @@ fn random_action(view: &GameView, rng: &mut StdRng) -> Action {
             let mut attacks = Vec::new();
             for o in options {
                 if rng.gen_bool(0.6) {
+                    // Sometimes a planeswalker, defended by its controller.
+                    let planeswalker = o
+                        .planeswalkers
+                        .choose(rng)
+                        .copied()
+                        .filter(|_| rng.gen_bool(0.5));
+                    let defender = match planeswalker.and_then(|pw| view.permanent(pw)) {
+                        Some(pw) => pw.controller,
+                        None => *o.defenders.choose(rng).unwrap(),
+                    };
                     attacks.push(Attack {
                         attacker: o.attacker,
-                        defender: *o.defenders.choose(rng).unwrap(),
+                        defender,
+                        planeswalker,
                     });
                 }
             }
@@ -59,15 +71,12 @@ fn random_action(view: &GameView, rng: &mut StdRng) -> Action {
                 cards: hand[..*count].to_vec(),
             }
         }
-        Prompt::ChooseCard {
-            options, optional, ..
+        Prompt::ChooseCards {
+            options, min, max, ..
         } => {
-            let card = if *optional && rng.gen_bool(0.2) {
-                None
-            } else {
-                options.choose(rng).copied()
-            };
-            Action::ChooseCard { card }
+            let n = rng.gen_range(*min..=(*max).min(options.len()));
+            let cards = options.choose_multiple(rng, n).map(|c| c.id).collect();
+            Action::ChooseCards { cards }
         }
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => {
             panic!("asked to act on {:?}", view.prompt)

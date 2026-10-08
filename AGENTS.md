@@ -25,7 +25,7 @@ not about avoiding every word Magic uses.
 | `magus-core` | Rules engine. **No I/O, no async, no networking.** Deterministic given a seed. |
 | `magus-protocol` | `ClientMsg`/`ServerMsg`, JSON-lines framing, `connect()` helper. |
 | `magus-server` | Lobby (rooms → pair two players), one tokio task per game owning the `Game`. Lib + bin. |
-| `magus-tui` | The `magus` binary: ratatui 0.29 / crossterm 0.28. `app.rs` = game state + input, `ui.rs` = drawing only (its card helpers are shared). `builder.rs` = `magus deck-builder` (state, then read-only drawing), `deckfile.rs` = deck files. |
+| `magus-tui` | The `magus` binary: ratatui 0.29 / crossterm 0.28. `app.rs` = game state + input, `ui.rs` = drawing only (its card helpers are shared). `builder.rs` = `magus deck-builder` and `cardbuilder.rs` = `magus card-builder` (each: state, then read-only drawing), `deckfile.rs` = deck files. |
 | `magus-bot` | AI client. Lib (`run`, `choose`) + bin. Also hosts the end-to-end test. |
 
 Key files in core:
@@ -82,6 +82,12 @@ Key files in core:
    be loaded from card packs and edited in a card builder. A new variant
    changes the pack format: document it in README's "Card packs" section. The
    serialized shape is pinned by tests in `card.rs`.
+8. **The card builder learns the vocabulary from core.** Its effect editor
+   edits an effect's serialized form and offers `Effect::examples()` plus the
+   `ALL` lists (`Keyword`, `Who`, `Whose`, `Trigger`, `CastZone`). Tests fail
+   if a new variant is missing from them. A new kind of *field* (not just a
+   new value) also needs its choices in `field_options` in `cardbuilder.rs`
+   (`null` in a choice list means "any"/"none").
 
 ## Engine notes
 
@@ -98,12 +104,22 @@ Key files in core:
 - `valid_targets(spec, caster)` takes the caster, because `TargetSpec::whose`
   (`anyone`/`you`/`opponent`) is relative to whoever controls the spell.
 - Resolution can pause for a choice. The top stack item stays on the stack
-  while it resolves; `apply_effects(item, from)` stops at an effect that needs
-  a decision (`put_from_hand`), stores `Choosing { item, effect, options }`
-  and sets `Pending::Choose`. `Action::ChooseCard` resumes from the next
-  effect, then `finish_resolving` removes the item and gives priority.
-  Triggers wait (`stack_triggers` is skipped while choosing). New mid-
-  resolution choices should reuse this.
+  while it resolves; `apply_effects(item, from)` asks `choice_options` whether
+  an effect needs cards chosen (`put_from_hand`, `search`), stores
+  `Choosing { item, effect, options, max }` and sets `Pending::Choose`.
+  `Action::ChooseCards` (validated against `options`/`max`) runs
+  `finish_choice`, resumes from the next effect, then `finish_resolving`
+  removes the item and gives priority. Triggers wait while choosing. New
+  choosing effects add a case to `choice_options` and `finish_choice`.
+- `Prompt::ChooseCards` carries full `CardView`s because options can be in a
+  hidden zone (a library during a search). It's only ever sent to the
+  chooser. Options are listed by name, never in library order, and every
+  search shuffles afterwards.
+- Cast options: `legal_plays` lists one `PlayOption` per way to cast a card
+  (`cast_ways`: normally, plus each cast option × each distinct card key its
+  search could find), with that way's `cost`. `Action::Cast { way }` must
+  match one exactly. Copies of a card are identical, so the engine fetches
+  any copy and no mid-cast choice is needed.
 - Casting from the graveyard: `legal_plays` also offers graveyard cards with
   `flashback`, `cast_cost` picks the cost by zone, and `spell_done` sends a
   spell cast from the graveyard to exile instead (also when it fizzles or is
@@ -120,6 +136,26 @@ Key files in core:
   actions run. To add a trigger: a `Trigger` variant, an `Event` variant if
   needed, a `fire` call where it happens, and the match arm in `fire`. Set
   `Trigger::has_player` if effects may use `Who::ThatPlayer`.
+- Characteristics are computed, never read off the card: use
+  `Game::power`/`toughness`/`has_keyword`, which add static abilities and
+  emblems (`BoostSource`s) to the printed values and "until end of turn"
+  changes. Hot paths (`check_state`, `view`, attack/block options) collect
+  `boost_sources()` once and use the `*_from` variants: calling the plain
+  versions per creature made the fuzz test twice as slow.
+- Counters live in `Object::counters` (loyalty so far); `move_to` clears
+  them and gives a planeswalker its starting loyalty when it enters. Damage
+  to a planeswalker removes loyalty; `check_state` puts one at 0 into the
+  graveyard.
+- Activated abilities are plays: `legal_plays` adds one `PlayKind::Ability(i)`
+  per usable ability (`ability_plays`, `can_pay`), and `Action::Activate`
+  must match one. Costs are paid at once (loyalty, tapping, mana); the
+  ability goes on the stack as `StackKind::Ability(i)` and may target.
+  Loyalty abilities: sorcery speed, once per planeswalker per turn.
+- `Attack::planeswalker` attacks a planeswalker; `defender` is then its
+  controller (who blocks). Damage to a planeswalker that has left goes nowhere.
+- Pending choices (`Choosing`) are either a paused resolution or the legend
+  rule (`ChoiceFor`), which `check_state` raises and `choose` resolves,
+  restoring what was pending before.
 - `Object::cast_from` is set by `cast()` and cleared by `move_to` for any move
   except stack → battlefield, so bounced-and-recast cards don't remember.
 - Combat damage is computed first, then applied, so it's simultaneous.

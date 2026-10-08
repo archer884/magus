@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Color {
     White,
     Blue,
@@ -89,6 +90,18 @@ impl ManaCost {
         Ok(cost)
     }
 
+    /// This cost made cheaper by `by`. Colored mana only reduces the same
+    /// color, and generic only generic, as in the real rules; nothing goes
+    /// below zero.
+    pub fn reduce(&self, by: &ManaCost) -> ManaCost {
+        let mut cost = *self;
+        cost.generic = cost.generic.saturating_sub(by.generic);
+        for (c, b) in cost.colored.iter_mut().zip(by.colored) {
+            *c = c.saturating_sub(b);
+        }
+        cost
+    }
+
     pub fn mana_value(&self) -> u32 {
         self.generic + self.colored.iter().sum::<u32>()
     }
@@ -154,6 +167,8 @@ mod tests {
         assert_eq!(ManaCost::parse("").to_string(), "");
         assert!(ManaCost::try_parse("2X").is_err());
         assert!(ManaCost::try_parse("1R1").is_err());
+        let reduced = ManaCost::parse("2BB").reduce(&ManaCost::parse("1BR"));
+        assert_eq!(reduced.to_string(), "{1}{B}");
     }
 
     #[test]

@@ -353,7 +353,13 @@ mod tests {
     #[test]
     fn loads_the_sample_pack() {
         let pool = load_pool(&[SAMPLE]).unwrap();
-        assert!(pool.card("gullwing-courier").is_some());
+        let courier = pool.card("gullwing-courier").unwrap();
+        assert_eq!(
+            courier.flavor,
+            Some(
+                "\"Another letter for the harbormaster.\nProbably more complaints about gulls.\"\n"
+            )
+        );
         assert_eq!(
             deck_infos(&pool).last().unwrap().key,
             "harbor-tides",

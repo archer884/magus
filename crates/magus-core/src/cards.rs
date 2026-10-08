@@ -20,6 +20,9 @@ const fn land(key: &'static str, name: &'static str, color: Color) -> CardDef {
         effects: &[],
         abilities: &[],
         flashback: None,
+        flavor: None,
+        cast_options: &[],
+        legendary: false,
     }
 }
 
@@ -44,6 +47,9 @@ const fn creature(
         effects: &[],
         abilities,
         flashback: None,
+        flavor: None,
+        cast_options: &[],
+        legendary: false,
     }
 }
 
@@ -64,6 +70,9 @@ const fn spell(
         effects,
         abilities: &[],
         flashback: None,
+        flavor: None,
+        cast_options: &[],
+        legendary: false,
     }
 }
 

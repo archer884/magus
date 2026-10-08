@@ -80,13 +80,37 @@ run the server on a reachable host. There's no TLS or authentication yet.
 
 ## Card packs
 
-A server can offer your own cards and decks alongside the built-in ones. Write
-them in a TOML file and pass it with `--cards` (repeat it for several packs):
+A server can offer your own cards and decks alongside the built-in ones. Make
+them with the card builder, or write the TOML file by hand, and pass it with
+`--cards` (repeat it for several packs):
 
 ```sh
 ./target/release/magus-server --cards my-pack.toml
 ./target/release/magus --solo --cards my-pack.toml   # solo mode too
 ```
+
+### The card builder
+
+```sh
+./target/release/magus card-builder --pack my-pack.toml
+```
+
+Your pack's cards are on the left, the selected card's fields in the middle,
+and a live preview on the right: how the card reads, or what's wrong with it.
+It opens an existing pack (keeping any decks in it) or starts a new one.
+
+- Cards list: `n` new card, `d` duplicate, `x` delete (press twice), Enter
+  or Tab to edit.
+- Card fields: Enter edits a field (type the text, Enter to finish, Esc to
+  cancel), ← → change choices and numbers, `x` removes an effect or ability
+  or clears an optional field. Which fields appear depends on the type.
+- Effects open an editor: ← → on `type` picks the kind of effect, and the
+  other fields change its details. It shows how the effect will read.
+- `s` saves, even an unfinished card, and says whether a server would accept
+  the pack. `q` quits (asking first if there are unsaved changes).
+
+Build a deck from your pack with `magus deck-builder --deck my-deck.toml --cards
+my-pack.toml`, and play it on any server started with `--cards my-pack.toml`.
 
 Pack decks appear in the deck list when players join. A pack looks like this
 (a full example is `crates/magus-core/tests/fixtures/sample-pack.toml`):
@@ -153,11 +177,100 @@ Effects that don't target: `draw` (`who`, `count`), `gain_life` /
 battlefield"; the player picks one while the spell resolves). `who` is `you`,
 `each_opponent`, or `that_player`.
 
+`search` searches your library ("tutoring"): you choose up to `count` cards
+(default 1) that match a filter, they go `to` your `hand` (the default),
+the `battlefield` (add `tapped = true` to have them enter tapped), or the
+`top_of_library`, and the library is shuffled (for `top_of_library`, the rest
+is shuffled and the first card you chose ends up on top). You may always find
+fewer, even none. The filter is any of `kind` (`creature`, `instant`,
+`sorcery`, `land`), `color` (for lands, the color of mana they make) and
+`named` (a card's name); leave them all out to find any card.
+
+```toml
+effects = [{ type = "search", kind = "land", color = "black", to = "battlefield", tapped = true }]
+effects = [{ type = "search", count = 2, to = "top_of_library" }]     # stack the deck
+effects = [{ type = "search", named = "Bog" }]
+```
+
+A card found for your hand is revealed (shown in the log) unless the search
+was for any card at all.
+
+A card can have **cast options**: "As you cast this spell, you may search your
+library for …. If you do, this spell costs {B} less to cast." The action is a
+`search` for one card, and `reduction` is how much cheaper it gets (colored
+mana only lowers the same color). When you cast the card you're offered each
+way: normally, or "bringing" each different card the search could find.
+
+```toml
+[[card.cast_option]]
+reduction = "B"
+action = { type = "search", kind = "land", color = "black", to = "battlefield", tapped = true }
+```
+
 An instant or sorcery can have `flashback = "2R"`: it may also be cast from your
 graveyard for that cost, and is then exiled instead of returning to the
 graveyard. Lands take `mana = "R"` (one symbol) and nothing else.
 
-Abilities trigger (`when`) on `enters` or `deals_combat_damage_to_player`. With
+### Abilities, planeswalkers and emblems
+
+Creatures and planeswalkers can have three kinds of `[[card.ability]]`:
+
+- `triggered`: "when X happens, do Y" (`when`, optional `only_if`, `effects`),
+  shown above.
+- `activated`: "pay a cost: do something". The `cost` is any of `loyalty`
+  (planeswalkers only), `tap = true` ({T}: the permanent taps, and a creature
+  can't do it the turn it arrives) and `mana`. It's activated like casting a
+  spell, and may have one targeted effect.
+- `static`: always on while the card is on the battlefield. Creatures
+  `whose` (default `you`) control get +`power`/+`toughness` and/or have a
+  `keyword`; `other = true` leaves out the card itself ("other creatures you
+  control get +1/+1", which players call a lord).
+
+```toml
+[[card.ability]]
+type = "activated"
+cost = { mana = "1", tap = true }           # {1}, {T}: …
+effects = [{ type = "damage", amount = 1, target = "any" }]
+
+[[card.ability]]
+type = "static"
+other = true
+power = 1
+toughness = 1
+```
+
+A **planeswalker** (`type = "planeswalker"`, with a starting `loyalty`) is an
+ally that fights with loyalty abilities instead of attacking or blocking:
+
+- Each activated ability's cost is a loyalty change, like `{ loyalty = 1 }`
+  for "+1" or `{ loyalty = -2 }` for "−2". You may use one loyalty ability per
+  planeswalker per turn, on your own turn when you could cast a sorcery, and
+  only if it has enough loyalty.
+- Opponents' creatures can attack it instead of you, and damage to it
+  (combat, or "any target" spells) removes loyalty. At 0 loyalty it goes to
+  the graveyard.
+- Its big last ability often gives you an **emblem**: `{ type = "emblem",
+  power = 2, toughness = 2, keyword = "flying" }` is "You get an emblem with
+  'Creatures you control get +2/+2 and have flying.'" An emblem lasts the rest
+  of the game and can't be removed.
+
+**Legendary** cards (`legendary = true`; planeswalkers always are) follow the
+legend rule: if you control two with the same name, you choose one to keep
+and the other goes to the graveyard.
+
+`crates/magus-core/tests/fixtures/sample-pack.toml` has a planeswalker, a lord,
+a {T} ability and a legendary creature.
+
+Any card can have `flavor`: text shown in italics under the rules text, with no
+effect on the game. TOML's triple-quoted strings work for several lines:
+
+```toml
+flavor = '''
+"I knew I forgot something..."
+'''
+```
+
+Triggered abilities (`when`) fire on `enters` or `deals_combat_damage_to_player`. With
 the second one, `that_player` means the player who was hit:
 
 ```toml
@@ -188,6 +301,7 @@ creature missing its toughness, a deck that isn't 60 cards, and so on.
 | a | Attack with everything (or nothing) |
 | Tab | Switch between hand, battlefield and stack to inspect cards |
 | g | Browse every graveyard; cast a card marked ● (flashback) from yours |
+| Enter (on the battlefield) | Activate an ability of the selected permanent (marked ●) |
 | Esc | Cancel targeting, close a popup, or choose nothing when that's allowed |
 | f | Full control: get asked at every step instead of auto-passing routine ones |
 | q | Quit (twice in a game, because leaving concedes) |
@@ -220,7 +334,7 @@ ignores an action that was meant for an older game state.
 One JSON object per line over TCP:
 
 ```
-→ {"type":"hello","name":"ann","protocol":3}
+→ {"type":"hello","name":"ann","protocol":6}
 ← {"type":"welcome","decks":[…]}
 → {"type":"join","room":"friday","deck":"ember-thorn"}
   (or your own deck: {"type":"join_custom","room":"friday","deck":{"name":"Burn","cards":{"blaze":4,"crag":56}}})
@@ -243,6 +357,9 @@ See `crates/magus-protocol/src/lib.rs` and `crates/magus-core/src/view.rs`.
 - Triggered abilities: "when this enters" and "whenever this deals combat damage to a player", optionally with an "if" about how the card was cast
 - Returning creature cards from the graveyard to the battlefield or hand, and blinking (a blinked creature is a new object, so spells aimed at it fizzle)
 - Putting a creature from your hand onto the battlefield without casting it, and casting spells from your graveyard (flashback), after which they're exiled
+- Planeswalkers: loyalty abilities, attacking them, damage removing loyalty; emblems
+- Activated abilities ({T}, mana) and static abilities ("other creatures you control get +1/+1")
+- Legendary permanents and the legend rule
 - Targets limited by whose they are ("creature you control", "spell an opponent controls")
 - "Until end of turn" boosts
 - Extra cards and decks from card packs

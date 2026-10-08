@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use magus_core::mana::Color;
-use magus_core::view::{CardView, PermanentView, Prompt};
+use magus_core::view::{CardView, PermanentView, PlayOption, Prompt};
 use magus_core::{GameView, ObjectId, PlayerId, Target};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -13,7 +13,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Focus, Mode, Screen, graveyard_entries};
+use crate::app::{App, Focus, Mode, Screen, attack_targets, graveyard_entries};
 
 pub(crate) const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
@@ -200,8 +200,14 @@ fn draw_game(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
     draw_detail(frame, detail, app, view);
     draw_log(frame, log, view);
 
-    if let Mode::Target { targets, sel, card } = &app.mode {
+    if let Mode::Target {
+        targets, sel, card, ..
+    } = &app.mode
+    {
         draw_target_popup(frame, area, view, *card, targets, *sel);
+    }
+    if let Mode::CastWay { plays, sel } = &app.mode {
+        draw_cast_way_popup(frame, area, view, plays, *sel);
     }
     if let Mode::Graveyard { sel } = &app.mode {
         draw_graveyard_popup(frame, area, app, view, *sel);
@@ -209,11 +215,13 @@ fn draw_game(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
     if let Mode::Choose {
         reason,
         options,
-        optional,
+        min,
+        max,
         sel,
+        marked,
     } = &app.mode
     {
-        draw_choose_popup(frame, area, view, reason, options, *optional, *sel);
+        draw_choose_popup(frame, area, reason, options, (*min, *max), *sel, marked);
     }
 }
 
@@ -279,6 +287,12 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
     let block = panel(Line::from(title), focused);
 
     let mut lines = vec![lands_line(view, p)];
+    for emblem in &player.emblems {
+        lines.push(Line::from(vec![
+            "Emblem: ".magenta().bold(),
+            Span::raw(emblem.clone()),
+        ]));
+    }
     let board = app.board_order();
     for perm in view
         .battlefield
@@ -289,7 +303,8 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
         let (marker, highlight) = match &app.mode {
             Mode::Idle => {
                 let selected = app.focus == Focus::Board && board.get(app.board_sel) == Some(&id);
-                ("", selected)
+                // ● marks permanents with an ability you could activate now.
+                (if app.is_playable(id) { "● " } else { "" }, selected)
             }
             Mode::Attack {
                 options,
@@ -315,7 +330,10 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
             Mode::Target { targets, sel, .. } => {
                 ("", targets.get(*sel) == Some(&Target::Permanent(id)))
             }
-            Mode::Discard { .. } | Mode::Graveyard { .. } | Mode::Choose { .. } => ("", false),
+            Mode::Discard { .. }
+            | Mode::Graveyard { .. }
+            | Mode::Choose { .. }
+            | Mode::CastWay { .. } => ("", false),
         };
         let mut line = permanent_line(view, perm, marker);
         if let Mode::Attack {
@@ -323,8 +341,13 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
         } = &app.mode
             && let Some(i) = options.iter().position(|o| o.attacker == id)
             && let Some(d) = chosen[i]
+            && let Some(&(defender, planeswalker)) = attack_targets(view, &options[i]).get(d)
         {
-            line.push_span(format!(" → {}", view.player_name(options[i].defenders[d])).yellow());
+            let whom = match planeswalker.and_then(|pw| view.permanent(pw)) {
+                Some(pw) => format!("{} ({})", pw.card.name, view.player_name(defender)),
+                None => view.player_name(defender).to_string(),
+            };
+            line.push_span(format!(" → {whom}").yellow());
         }
         if let Mode::Block {
             options, chosen, ..
@@ -399,9 +422,12 @@ fn permanent_line(view: &GameView, perm: &PermanentView, marker: &str) -> Line<'
             pt.bold()
         });
     }
-    if !perm.card.keywords.is_empty() {
+    if let Some(loyalty) = perm.loyalty {
+        spans.push(format!(" [{loyalty}]").magenta().bold());
+    }
+    // Current keywords: some may be granted by static abilities or emblems.
+    if !perm.keywords.is_empty() {
         let kws: Vec<_> = perm
-            .card
             .keywords
             .iter()
             .map(|k| k.name().to_lowercase())
@@ -418,10 +444,13 @@ fn permanent_line(view: &GameView, perm: &PermanentView, marker: &str) -> Line<'
         spans.push(format!(" {} dmg", perm.damage).red());
     }
     if let Some(defender) = perm.attacking {
-        let who = if defender == view.you {
-            "you".to_string()
-        } else {
-            view.player_name(defender).to_string()
+        let who = match perm
+            .attacking_planeswalker
+            .and_then(|pw| view.permanent(pw))
+        {
+            Some(pw) => pw.card.name.clone(),
+            None if defender == view.you => "you".to_string(),
+            None => view.player_name(defender).to_string(),
         };
         spans.push(format!(" ⚔ attacking {who}").light_red().bold());
     }
@@ -524,13 +553,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
             "Declare blockers".bold().into(),
             "↑↓: creature · Space/←→: choose attacker to block · Enter: confirm".into(),
         ),
-        (Mode::Choose { optional, .. }, _) => (
-            "Choose a card".bold().into(),
-            if *optional {
-                "↑↓: select · Enter: choose · Esc: choose nothing".into()
+        (Mode::Choose { min, max, .. }, _) => (
+            if *max == 1 {
+                "Choose a card".bold().into()
             } else {
-                "↑↓: select · Enter: choose".into()
+                format!("Choose up to {max} cards").bold().into()
             },
+            match (*min, *max) {
+                (0, 1) => "↑↓: select · Enter: choose · Esc: choose nothing".into(),
+                (_, 1) => "↑↓: select · Enter: choose".into(),
+                _ => "↑↓: select · Space: mark · Enter: choose marked · Esc: choose nothing".into(),
+            },
+        ),
+        (Mode::CastWay { .. }, _) => (
+            "Which one?".bold().into(),
+            "↑↓: select · Enter: choose · Esc: cancel".into(),
         ),
         (Mode::Graveyard { .. }, _) => (
             "Graveyards".bold().into(),
@@ -635,6 +672,18 @@ pub(crate) fn card_lines(card: &CardView) -> Vec<Line<'static>> {
             .lines()
             .map(|l| Line::from(mana_text(l, Style::new()))),
     );
+    if let Some(loyalty) = card.loyalty {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Loyalty {loyalty}")).bold());
+    }
+    if let Some(flavor) = card.flavor.as_deref().filter(|f| !f.trim().is_empty()) {
+        lines.push(Line::from(""));
+        lines.extend(
+            flavor
+                .lines()
+                .map(|l| Line::from(l.to_string()).italic().dark_gray()),
+        );
+    }
     lines
 }
 
@@ -700,23 +749,27 @@ fn draw_graveyard_popup(frame: &mut Frame, area: Rect, app: &App, view: &GameVie
 fn draw_choose_popup(
     frame: &mut Frame,
     area: Rect,
-    view: &GameView,
     reason: &str,
-    options: &[ObjectId],
-    optional: bool,
+    options: &[CardView],
+    (min, max): (usize, usize),
     sel: usize,
+    marked: &[ObjectId],
 ) {
     let mut items: Vec<ListItem> = options
         .iter()
-        .filter_map(|&id| view.hand_card(id))
         .map(|card| {
-            let mut spans = vec![card_name(card), Span::raw(" ")];
+            let mark = match marked.iter().position(|&id| id == card.id) {
+                Some(i) => format!("{}. ", i + 1).green(),
+                None if max > 1 => "   ".into(),
+                None => "".into(),
+            };
+            let mut spans = vec![mark, card_name(card), Span::raw(" ")];
             spans.extend(mana_text(&card.cost, Style::new()));
             spans.push(format!("  {}", card.type_line).dark_gray());
             ListItem::new(Line::from(spans))
         })
         .collect();
-    if optional {
+    if min == 0 {
         items.push(ListItem::new(Line::from("(nothing)").dark_gray()));
     }
     let width = 64.min(area.width);
@@ -732,7 +785,12 @@ fn draw_choose_popup(
         height,
     };
     frame.render_widget(Clear, popup);
-    let block = panel(" Choose a card ", true);
+    let title = if max == 1 {
+        " Choose a card ".to_string()
+    } else {
+        format!(" Choose up to {max} cards ")
+    };
+    let block = panel(title, true);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [top, _, list] = Layout::vertical([
@@ -744,6 +802,62 @@ fn draw_choose_popup(
     frame.render_widget(reason, top);
     let mut state = ListState::default().with_selected(Some(sel));
     frame.render_stateful_widget(List::new(items).highlight_style(SELECTED), list, &mut state);
+}
+
+fn draw_cast_way_popup(
+    frame: &mut Frame,
+    area: Rect,
+    view: &GameView,
+    plays: &[PlayOption],
+    sel: usize,
+) {
+    let name = plays
+        .first()
+        .and_then(|p| {
+            view.hand_card(p.card)
+                .or_else(|| view.permanent(p.card).map(|perm| &perm.card))
+        })
+        .map_or("it".to_string(), |c| c.name.clone());
+    let items: Vec<ListItem> = plays
+        .iter()
+        .map(|play| {
+            let spans = match (&play.ability, &play.way) {
+                (Some(text), _) => mana_text(text, Style::new()),
+                (None, way) => {
+                    let how = match way {
+                        None => "normally".to_string(),
+                        Some(way) => format!("bringing {}", way.fetch_name),
+                    };
+                    let mut spans = vec![Span::raw(format!("Cast {how}  "))];
+                    spans.extend(mana_text(&play.cost, Style::new()));
+                    spans
+                }
+            };
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let height = (items.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let width = 56.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let mut state = ListState::default().with_selected(Some(sel));
+    let verb = if plays.iter().any(|p| p.ability.is_some()) {
+        "Activate"
+    } else {
+        "Cast"
+    };
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(format!(" {verb} {name} "), true))
+            .highlight_style(SELECTED),
+        popup,
+        &mut state,
+    );
 }
 
 fn draw_target_popup(

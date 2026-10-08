@@ -16,10 +16,14 @@ pub struct CardView {
     pub mana_value: u32,
     pub type_line: String,
     pub text: String,
+    /// Flavor text, if any: shown in italics, with no effect on play.
+    pub flavor: Option<String>,
     pub colors: Vec<Color>,
     pub keywords: Vec<Keyword>,
     pub power: Option<i32>,
     pub toughness: Option<i32>,
+    /// A planeswalker's starting loyalty.
+    pub loyalty: Option<i32>,
     pub is_land: bool,
     pub is_creature: bool,
 }
@@ -35,10 +39,12 @@ impl CardView {
             mana_value: cost.mana_value(),
             type_line: def.type_line(),
             text: def.rules_text(),
+            flavor: def.flavor.map(str::to_string),
             colors: def.colors(),
             keywords: def.keywords.to_vec(),
             power: def.power(),
             toughness: def.toughness(),
+            loyalty: def.loyalty(),
             is_land: def.is_land(),
             is_creature: def.is_creature(),
         }
@@ -54,10 +60,18 @@ pub struct PermanentView {
     /// Entered this turn and can't attack yet.
     pub summoning_sick: bool,
     pub damage: i32,
-    /// Current power and toughness, including temporary boosts.
+    /// Current power and toughness, including temporary boosts and static
+    /// abilities.
     pub power: Option<i32>,
     pub toughness: Option<i32>,
+    /// Current keywords, including ones granted by static abilities.
+    pub keywords: Vec<Keyword>,
+    /// A planeswalker's current loyalty.
+    pub loyalty: Option<i32>,
+    /// The player it's attacking (the planeswalker's controller, if it's
+    /// attacking a planeswalker).
     pub attacking: Option<PlayerId>,
+    pub attacking_planeswalker: Option<ObjectId>,
     pub blocking: Option<ObjectId>,
 }
 
@@ -80,6 +94,8 @@ pub struct PlayerView {
     pub library_size: usize,
     pub graveyard: Vec<CardView>,
     pub exile: Vec<CardView>,
+    /// What each of their emblems says.
+    pub emblems: Vec<String>,
     pub lost: bool,
 }
 
@@ -88,6 +104,9 @@ pub struct PlayerView {
 pub enum PlayKind {
     Land,
     Spell,
+    /// Activate the card's activated ability with this index (`card` is
+    /// then a permanent on the battlefield).
+    Ability(usize),
 }
 
 /// A card you could play right now. Spells that target list every legal target.
@@ -96,12 +115,32 @@ pub struct PlayOption {
     pub card: ObjectId,
     pub kind: PlayKind,
     pub targets: Option<Vec<Target>>,
+    /// For a spell, what this way of casting it costs, e.g. "{2}{B}".
+    pub cost: String,
+    /// Set when this is one of a card's optional ways to cast it.
+    pub way: Option<CastWay>,
+    /// For an ability, its text, e.g. "−2: Deal 3 damage to target creature."
+    pub ability: Option<String>,
+}
+
+/// One of a card's optional ways to cast it (a cast option), and the card
+/// it would fetch. Sent back in [`crate::Action::Cast`] to choose it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastWay {
+    /// Which of the card's cast options.
+    pub option: usize,
+    /// The key of the card it fetches.
+    pub fetch: String,
+    /// That card's name, for showing to the player.
+    pub fetch_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttackOption {
     pub attacker: ObjectId,
     pub defenders: Vec<PlayerId>,
+    /// Opponents' planeswalkers it may attack instead.
+    pub planeswalkers: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,14 +173,17 @@ pub enum Prompt {
     Discard {
         count: usize,
     },
-    /// A spell or ability you control asks you to choose one of these cards
-    /// (in your hand), or none if `optional`.
-    ChooseCard {
-        /// What the choice is for, e.g. "put a creature card from your hand
-        /// onto the battlefield".
+    /// Choose between `min` and `max` of these cards: for a spell or ability
+    /// you control, or for the legend rule. They may be in a hidden zone, such as your
+    /// library during a search, so the cards are shown here in full.
+    ChooseCards {
+        /// What the choice is for, e.g. "Beckon the Wild: you may put a
+        /// creature card from your hand onto the battlefield".
         reason: String,
-        options: Vec<ObjectId>,
-        optional: bool,
+        options: Vec<CardView>,
+        /// At least this many must be chosen (usually 0).
+        min: usize,
+        max: usize,
     },
     GameOver {
         winner: Option<PlayerId>,

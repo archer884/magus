@@ -10,6 +10,10 @@ subtype = "Bird"
 power = 1
 toughness = 2
 keywords = ["flying"]
+flavor = '''
+"Another letter for the harbormaster.
+Probably more complaints about gulls."
+'''
 
 [[card.ability]]
 type = "triggered"
@@ -67,6 +71,117 @@ effects = [
     { type = "draw", who = "you", count = 1 },
 ]
 
+# Can bring a land with it: cheaper, and one more land on the battlefield.
+[[card]]
+key = "mire-herald"
+name = "Mire Herald"
+type = "creature"
+cost = "2BB"
+subtype = "Knight"
+power = 3
+toughness = 3
+
+[[card.cast_option]]
+reduction = "B"
+action = { type = "search", kind = "land", color = "black", to = "battlefield", tapped = true }
+
+# Stacks the deck: picks the next two draws.
+[[card]]
+key = "tidal-archivist"
+name = "Tidal Archivist"
+type = "creature"
+cost = "3U"
+subtype = "Wizard"
+power = 2
+toughness = 3
+
+[[card.ability]]
+type = "triggered"
+when = "enters"
+effects = [{ type = "search", count = 2, to = "top_of_library" }]
+
+# Any card at all, straight to hand (and the opponent doesn't see which).
+[[card]]
+key = "deep-recall"
+name = "Deep Recall"
+type = "sorcery"
+cost = "2B"
+effects = [{ type = "search" }]
+
+[[card]]
+key = "chart-the-shoals"
+name = "Chart the Shoals"
+type = "sorcery"
+cost = "1U"
+effects = [{ type = "search", kind = "land", color = "blue", count = 2 }]
+
+# A planeswalker: loyalty abilities, one per turn, and an emblem at the end.
+[[card]]
+key = "ilsa-tide-warden"
+name = "Ilsa, Tide Warden"
+type = "planeswalker"
+cost = "2UB"
+subtype = "Ilsa"
+loyalty = 4
+
+[[card.ability]]
+type = "activated"
+cost = { loyalty = 1 }
+effects = [{ type = "draw", who = "you", count = 1 }]
+
+[[card.ability]]
+type = "activated"
+cost = { loyalty = -2 }
+effects = [{ type = "damage", amount = 3, target = "creature" }]
+
+[[card.ability]]
+type = "activated"
+cost = { loyalty = -5 }
+effects = [{ type = "emblem", power = 2, toughness = 2, keyword = "flying" }]
+
+# A lord: makes the rest of the team bigger.
+[[card]]
+key = "harbor-captain"
+name = "Harbor Captain"
+type = "creature"
+cost = "2U"
+subtype = "Pirate"
+power = 2
+toughness = 2
+
+[[card.ability]]
+type = "static"
+other = true
+power = 1
+toughness = 1
+
+# An activated ability that costs mana and tapping.
+[[card]]
+key = "reefshot-sniper"
+name = "Reefshot Sniper"
+type = "creature"
+cost = "1B"
+subtype = "Pirate"
+power = 1
+toughness = 1
+
+[[card.ability]]
+type = "activated"
+cost = { mana = "1", tap = true }
+effects = [{ type = "damage", amount = 1, target = "any" }]
+
+# Legendary: a second copy makes its controller keep just one.
+[[card]]
+key = "old-gull"
+name = "Old Gull, Harbor King"
+type = "creature"
+cost = "3U"
+subtype = "Bird"
+power = 3
+toughness = 3
+legendary = true
+keywords = ["flying"]
+
 [[deck]]
 key = "harbor-tides"
 name = "Harbor Tides"
@@ -77,10 +192,14 @@ gullwing-courier = 4
 harbor-toll = 4
 riptide-lash = 4
 saltmarsh-cutpurse = 4
-mistwing-drake = 4
-fen-stalker = 4
+mire-herald = 2
+tidal-archivist = 2
+reefshot-sniper = 2
+old-gull = 2
 wailing-shade = 4
-cove-scholar = 4
-night-leech = 4
+deep-recall = 2
+chart-the-shoals = 2
+ilsa-tide-warden = 2
+harbor-captain = 2
 lagoon = 12
 bog = 12

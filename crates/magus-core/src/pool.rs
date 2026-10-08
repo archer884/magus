@@ -10,7 +10,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::{Ability, CardDef, CardKind, Condition, Effect, Keyword, Trigger};
+use crate::card::{
+    Ability, ActivationCost, CardDef, CardKind, CastOption, Condition, Effect, Keyword, Trigger,
+    Whose,
+};
 use crate::cards::{self, DeckList};
 use crate::mana::Color;
 
@@ -46,6 +49,12 @@ pub struct CardSpec {
     pub power: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toughness: Option<i32>,
+    /// For planeswalkers, the loyalty it enters with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loyalty: Option<i32>,
+    /// Legendary (planeswalkers always are): see the legend rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legendary: bool,
     /// For lands, the mana symbol it taps for, e.g. `"R"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mana: Option<String>,
@@ -58,18 +67,25 @@ pub struct CardSpec {
     /// For instants and sorceries, a cost for casting it from the graveyard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flashback: Option<String>,
+    /// Flavor text, shown in italics under the rules text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flavor: Option<String>,
+    #[serde(default, rename = "cast_option", skip_serializing_if = "Vec::is_empty")]
+    pub cast_options: Vec<CastOptionSpec>,
     // Last, because TOML writes arrays of tables after plain fields.
     #[serde(default, rename = "ability", skip_serializing_if = "Vec::is_empty")]
     pub abilities: Vec<AbilitySpec>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpecKind {
-    Creature,
-    Instant,
-    Sorcery,
-    Land,
+/// A card's type in a pack file.
+pub use crate::card::CardType as SpecKind;
+
+/// An owned [`CastOption`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CastOptionSpec {
+    pub action: Effect,
+    pub reduction: String,
 }
 
 /// An owned [`Ability`].
@@ -82,6 +98,39 @@ pub enum AbilitySpec {
         only_if: Option<Condition>,
         effects: Vec<Effect>,
     },
+    Activated {
+        cost: CostSpec,
+        effects: Vec<Effect>,
+    },
+    Static {
+        #[serde(default = "Whose::you")]
+        whose: Whose,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        other: bool,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        power: i32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        toughness: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keyword: Option<Keyword>,
+    },
+}
+
+/// An owned [`ActivationCost`]: e.g. `{ loyalty = -2 }`, `{ tap = true }`,
+/// `{ mana = "1R", tap = true }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loyalty: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mana: Option<String>,
+}
+
+fn is_zero(n: &i32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -151,6 +200,7 @@ impl CardPool {
         let mut cards: Vec<_> = self.cards.values().collect();
         cards.sort_by_key(|c| c.key);
         for def in cards {
+            problems.extend(self.search_problems(def));
             problems.extend(
                 def.problems()
                     .into_iter()
@@ -190,6 +240,11 @@ impl CardPool {
         combined
             .cards
             .extend(new_cards.values().map(|def| (def.key, *def)));
+        let mut new_defs: Vec<_> = new_cards.values().collect();
+        new_defs.sort_by_key(|def| def.key);
+        for def in new_defs {
+            problems.extend(combined.search_problems(def));
+        }
         let mut deck_keys: HashSet<String> = self.decks.iter().map(|d| d.key.to_string()).collect();
         let mut new_decks = Vec::new();
         for spec in pack.decks {
@@ -211,6 +266,26 @@ impl CardPool {
         self.cards = combined.cards;
         self.decks.extend(new_decks);
         Ok(())
+    }
+
+    /// Searches in `def` for a card named something no card in the pool is
+    /// called: almost certainly a typo, since they could never find anything.
+    fn search_problems(&self, def: &CardDef) -> Vec<String> {
+        let ability_effects = def.abilities.iter().flat_map(|a| a.effects().iter());
+        let cast_actions = def.cast_options.iter().map(|o| &o.action);
+        def.effects
+            .iter()
+            .chain(ability_effects)
+            .chain(cast_actions)
+            .filter_map(|e| e.search_filter()?.named)
+            .filter(|name| self.cards.values().all(|c| c.name != *name))
+            .map(|name| {
+                format!(
+                    "card {:?}: searches for a card named {name:?}, but no card has that name",
+                    def.key
+                )
+            })
+            .collect()
     }
 
     fn deck_problems(&self, deck: &DeckList) -> Vec<String> {
@@ -253,6 +328,15 @@ impl CardPool {
     }
 }
 
+/// Builds `spec` on its own, for a card editor's live preview: the definition
+/// it makes, or why it can't be built. Doesn't check that its key is free.
+///
+/// The definition is leaked, like every pack card; an editor should only call
+/// this when the card has changed.
+pub fn preview_card(spec: &CardSpec) -> Result<&'static CardDef, Vec<String>> {
+    build_card(spec.clone())
+}
+
 /// Turns a spec into a validated, leaked definition.
 fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
     let mut problems = Vec::new();
@@ -266,6 +350,13 @@ fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
         },
         SpecKind::Instant => Some(CardKind::Instant),
         SpecKind::Sorcery => Some(CardKind::Sorcery),
+        SpecKind::Planeswalker => match spec.loyalty {
+            Some(loyalty) => Some(CardKind::Planeswalker { loyalty }),
+            None => {
+                problems.push("a planeswalker needs a starting `loyalty`".into());
+                None
+            }
+        },
         SpecKind::Land => {
             let mut symbols = spec.mana.as_deref().unwrap_or("").chars();
             match (symbols.next().and_then(Color::from_symbol), symbols.next()) {
@@ -284,6 +375,9 @@ fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
     }
     if spec.kind != SpecKind::Land && spec.mana.is_some() {
         problems.push("only lands have `mana`".into());
+    }
+    if spec.kind != SpecKind::Planeswalker && spec.loyalty.is_some() {
+        problems.push("only planeswalkers have `loyalty`".into());
     }
     let Some(kind) = kind else {
         return Err(problems);
@@ -310,10 +404,42 @@ fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
                     only_if,
                     effects: effects.leak(),
                 },
+                AbilitySpec::Activated { cost, effects } => Ability::Activated {
+                    cost: ActivationCost {
+                        loyalty: cost.loyalty,
+                        tap: cost.tap,
+                        mana: cost.mana.map(leak),
+                    },
+                    effects: effects.leak(),
+                },
+                AbilitySpec::Static {
+                    whose,
+                    other,
+                    power,
+                    toughness,
+                    keyword,
+                } => Ability::Static {
+                    whose,
+                    other,
+                    power,
+                    toughness,
+                    keyword,
+                },
             })
             .collect::<Vec<_>>()
             .leak(),
         flashback: spec.flashback.map(leak),
+        flavor: spec.flavor.map(leak),
+        cast_options: spec
+            .cast_options
+            .into_iter()
+            .map(|o| CastOption {
+                action: o.action,
+                reduction: leak(o.reduction),
+            })
+            .collect::<Vec<_>>()
+            .leak(),
+        legendary: spec.legendary,
     };
     problems.extend(def.problems());
     if problems.is_empty() {
@@ -358,6 +484,10 @@ mod tests {
             keywords: vec![Keyword::Flying],
             effects: vec![],
             flashback: None,
+            flavor: None,
+            cast_options: vec![],
+            loyalty: None,
+            legendary: false,
             abilities: vec![AbilitySpec::Triggered {
                 when: Trigger::Enters,
                 only_if: None,
@@ -484,8 +614,8 @@ mod tests {
         assert_eq!(
             problems,
             [
-                "card \"test-curse\": ability 1 uses \"that_player\", but its trigger doesn't \
-                 involve a player",
+                "card \"test-curse\": ability 1 uses \"that_player\", but nothing it reacts to \
+                 involves a player",
                 "card \"test-hex\": \"that_player\" only works in an ability triggered by a player",
             ]
         );
@@ -518,5 +648,71 @@ mod tests {
         let written = toml::to_string(&pack).unwrap();
         let again: Pack = toml::from_str(&written).unwrap();
         assert_eq!(again, pack, "written as:\n{written}");
+    }
+
+    #[test]
+    fn searches_must_name_a_real_card() {
+        let mut seeker = creature("test-seeker");
+        seeker.abilities = vec![AbilitySpec::Triggered {
+            when: Trigger::Enters,
+            only_if: None,
+            effects: vec![Effect::Search {
+                kind: None,
+                color: None,
+                named: Some("Bgo".into()),
+                count: 1,
+                to: crate::card::Destination::Hand,
+                tapped: false,
+            }],
+        }];
+        let pack = Pack {
+            cards: vec![seeker],
+            decks: vec![],
+        };
+        let PackError(problems) = CardPool::builtin().add_pack(pack).unwrap_err();
+        assert_eq!(
+            problems,
+            ["card \"test-seeker\": searches for a card named \"Bgo\", but no card has that name"]
+        );
+    }
+
+    #[test]
+    fn loyalty_abilities_belong_to_planeswalkers() {
+        let mut creature_with_loyalty = creature("test-confused");
+        creature_with_loyalty.abilities = vec![AbilitySpec::Activated {
+            cost: CostSpec {
+                loyalty: Some(1),
+                ..CostSpec::default()
+            },
+            effects: vec![Effect::Draw {
+                who: Who::You,
+                count: 1,
+            }],
+        }];
+        let mut walker = creature("test-walker");
+        walker.kind = SpecKind::Planeswalker;
+        walker.power = None;
+        walker.toughness = None;
+        walker.keywords = vec![];
+        walker.loyalty = Some(3);
+        walker.abilities = vec![AbilitySpec::Static {
+            whose: Whose::You,
+            other: false,
+            power: 1,
+            toughness: 0,
+            keyword: None,
+        }];
+        let pack = Pack {
+            cards: vec![creature_with_loyalty, walker],
+            decks: vec![],
+        };
+        let PackError(problems) = CardPool::builtin().add_pack(pack).unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "card \"test-confused\": ability 1: only planeswalkers have loyalty abilities",
+                "card \"test-walker\": a planeswalker needs at least one loyalty ability",
+            ]
+        );
     }
 }
