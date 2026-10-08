@@ -36,6 +36,11 @@ how the codebase fits together before picking something up.
 
 ## Cards as data
 
+- [ ] **Flavor text**: an optional `flavor` field on cards (TOML multi-line
+      strings work well), shown in italics under the rules text, with no
+      effect on the game.
+- [ ] **Card art** in packs: an optional `art` field (ASCII art inline, or a
+      path to an image). See the card view under Clients.
 - [x] Card packs: extra cards and decks loaded from TOML (`--cards`), added
       to the built-in pool (`magus-core/src/pool.rs`). Built-in cards stay in
       Rust for now.
@@ -53,15 +58,17 @@ how the codebase fits together before picking something up.
       graveyard; `return_to_battlefield`, `return_to_hand`, `blink`. Built-in
       cards: Call from the Mire, Gravecall Wraith, Mossgrave Recovery,
       Veilstep.
-- [ ] Alternate paths, next: a keyword for casting from the graveyard
-      (`legal_plays` offers graveyard cards; `CastZone::Graveyard`), and "put
-      a creature card from your hand onto the battlefield" (a non-target
-      choice, so a new `Pending`/`Prompt`).
-- [ ] Target restrictions such as "creature you control" or "card in any
-      graveyard". These are new `TargetKind`s; if they multiply, switch to a
-      filter struct (zone, card type, whose).
-- [ ] An exile zone. `blink` exiles and returns at once, so nothing needs to
-      stay exiled yet.
+- [x] Alternate paths, second slice: flashback (cast from the graveyard, then
+      exile), an exile zone, `put_from_hand` with a mid-resolution choice
+      (`Pending::Choose`), and `whose` target restrictions. Built-in cards:
+      Sparkfall, Beckon the Wild; Veilstep now targets your own creature.
+- [x] Color mana symbols in the TUI wherever costs appear.
+- [ ] More choices during resolution: "choose a card in your graveyard",
+      "search your library" (hidden information: only the chooser may see
+      the options, and the library must be shuffled afterwards), "choose one
+      of these modes".
+- [ ] Target filters beyond kind + whose (e.g. "creature with flying",
+      "power 3 or less"). If these multiply, make the target a filter struct.
 - [ ] The bot only knows built-in cards (`cards::card`), so it never casts a
       pack's targeted spells. It needs card definitions from the server (see
       next item), or a hint in the prompt about what a spell does.
@@ -72,15 +79,23 @@ how the codebase fits together before picking something up.
 
 ## Server: persistence, accounts, trading
 
+- [ ] **A server rule against outside cards** (e.g. `--no-custom-cards`).
+      Today a server only knows its own pool, so a deck with a card it lacks
+      is already refused. The flag matters once players can bring their own
+      card definitions (uploading cards made in the card builder).
 - [ ] **Database** (SQLite via `sqlx` or `rusqlite` to start; Postgres-ready).
       Tables: players/accounts, card collection (player × card × quantity),
       saved decks, match history, trade offers.
 - [ ] **Accounts & auth.** Today `hello` carries a free-form name. Add
       register/login (argon2 password hashes, session tokens). Bump
       `PROTOCOL_VERSION`.
-- [ ] **Collections & deck building.** Players own cards; decks are built from
-      the collection and validated server-side (60-card minimum, ≤4 copies,
-      format rules).
+- [x] Deck builder (`magus deck-builder --deck deck.toml`), deck files, playing
+      them with `--deck <file>` (`ClientMsg::JoinCustom`, checked against the
+      server's pool), and the 4-copy limit.
+- [ ] Build decks against a remote server's cards (`deck-builder --server`);
+      needs the card catalog message above.
+- [ ] **Collections.** Players own cards; decks are built from the collection
+      and validated server-side (format rules too).
 - [ ] **Trading.** Offer/accept/cancel between two players. It must be atomic in
       a DB transaction, so a card can't be both traded and kept.
 - [ ] Card acquisition (starter collection, packs, rewards). A design question.
@@ -124,10 +139,16 @@ average, ~12.6 KB max** per message. Every change resends the *entire*
 
 ## Clients
 
+- [ ] **Card view**: an inspect screen that draws a whole "virtual card"
+      (name and cost bar, art box, type line, rules text, flavor text,
+      power/toughness). Art is optional: ASCII art from the pack, or a real
+      image on terminals that support one (kitty/iTerm2/sixel graphics, e.g.
+      the way `viu` does it), falling back to the ASCII art or nothing.
 - [ ] Mulligan, reconnect and account screens in the TUI.
 - [ ] Configurable auto-pass "stops" (which steps you want to be asked at).
       Currently hard-coded in `App::wants_stop`.
-- [ ] Graveyard viewer; card zoom; showing the opponent's last-played card.
+- [ ] Card zoom; showing the opponent's last-played card; an exile viewer
+      (the graveyard viewer, `g`, could grow a tab for it).
 - [ ] In-game chat.
 - [ ] A smarter bot (it currently plays greedily and never bluffs).
 - [ ] A web client: the protocol is already rules-free, so it's mostly rendering.

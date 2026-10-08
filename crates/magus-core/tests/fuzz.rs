@@ -59,6 +59,16 @@ fn random_action(view: &GameView, rng: &mut StdRng) -> Action {
                 cards: hand[..*count].to_vec(),
             }
         }
+        Prompt::ChooseCard {
+            options, optional, ..
+        } => {
+            let card = if *optional && rng.gen_bool(0.2) {
+                None
+            } else {
+                options.choose(rng).copied()
+            };
+            Action::ChooseCard { card }
+        }
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => {
             panic!("asked to act on {:?}", view.prompt)
         }
@@ -70,6 +80,7 @@ fn card_count(view: &GameView, p: usize) -> usize {
     pl.hand_size
         + pl.library_size
         + pl.graveyard.len()
+        + pl.exile.len()
         + view
             .battlefield
             .iter()
@@ -101,7 +112,7 @@ fn random_games_finish_and_conserve_cards() {
         let mut rng = StdRng::seed_from_u64(seed);
         let a = decks[seed as usize % decks.len()];
         let b = decks[(seed as usize / decks.len()) % decks.len()];
-        let seats = [("A".to_string(), a), ("B".to_string(), b)];
+        let seats = [("A".to_string(), a.cards), ("B".to_string(), b.cards)];
         let mut game = Game::new(&pool, &seats, seed);
         for _ in 0..20_000 {
             let Some(p) = game.waiting_on() else { break };

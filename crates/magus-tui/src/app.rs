@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use magus_core::view::{AttackOption, BlockOption, CardView, PlayKind, Prompt};
-use magus_core::{Action, Attack, Block, GameView, ObjectId, Step, Target};
-use magus_protocol::{ClientMsg, DeckInfo, ServerMsg};
+use magus_core::{Action, Attack, Block, GameView, ObjectId, PlayerId, Step, Target};
+use magus_protocol::{ClientMsg, CustomDeck, DeckInfo, ServerMsg};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub enum Screen {
@@ -44,11 +44,32 @@ pub enum Mode {
         count: usize,
         marked: HashSet<ObjectId>,
     },
+    /// Browsing every graveyard, to read cards or cast one with flashback.
+    Graveyard {
+        sel: usize,
+    },
+    /// Answering a [`Prompt::ChooseCard`]. When `optional`, the entry after
+    /// the last option means "nothing".
+    Choose {
+        reason: String,
+        options: Vec<ObjectId>,
+        optional: bool,
+        sel: usize,
+    },
+}
+
+/// The deck to join with, if chosen before connecting.
+#[derive(Debug, Clone)]
+pub enum DeckChoice {
+    /// One the server offers, by key.
+    Offered(String),
+    /// The player's own decklist (from a deck file given as `--deck`).
+    Custom(CustomDeck),
 }
 
 pub struct App {
     pub room: String,
-    pub deck: Option<String>,
+    pub deck: Option<DeckChoice>,
     pub screen: Screen,
     pub decks: Vec<DeckInfo>,
     pub deck_sel: usize,
@@ -69,7 +90,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(tx: UnboundedSender<ClientMsg>, room: String, deck: Option<String>) -> App {
+    pub fn new(tx: UnboundedSender<ClientMsg>, room: String, deck: Option<DeckChoice>) -> App {
         App {
             room,
             deck,
@@ -115,7 +136,11 @@ impl App {
             ServerMsg::Welcome { decks } => {
                 self.decks = decks;
                 match self.deck.clone() {
-                    Some(deck) => self.join(deck),
+                    Some(DeckChoice::Offered(deck)) => self.join(deck),
+                    Some(DeckChoice::Custom(deck)) => {
+                        let room = self.room.clone();
+                        self.send(ClientMsg::JoinCustom { room, deck });
+                    }
                     None => self.screen = Screen::PickDeck,
                 }
             }
@@ -141,6 +166,16 @@ impl App {
             Prompt::DeclareBlockers { options } => Mode::Block {
                 chosen: vec![None; options.len()],
                 options: options.clone(),
+                sel: 0,
+            },
+            Prompt::ChooseCard {
+                reason,
+                options,
+                optional,
+            } => Mode::Choose {
+                reason: reason.clone(),
+                options: options.clone(),
+                optional: *optional,
                 sel: 0,
             },
             Prompt::Discard { count } => {
@@ -218,6 +253,8 @@ impl App {
                 }
             }
             Mode::Discard { .. } => view.hand.get(self.hand_sel)?.id,
+            Mode::Graveyard { sel } => graveyard_entries(view).get(*sel)?.1.id,
+            Mode::Choose { options, sel, .. } => *options.get(*sel)?,
             Mode::Idle => match self.focus {
                 Focus::Hand => view.hand.get(self.hand_sel)?.id,
                 Focus::Board => *self.board_order().get(self.board_sel)?,
@@ -329,9 +366,46 @@ impl App {
                         }
                     }
                     KeyCode::Enter => self.play_selected(&view),
+                    KeyCode::Char('g') => {
+                        if graveyard_entries(&view).is_empty() {
+                            self.status = Some("All graveyards are empty.".into());
+                        } else {
+                            self.mode = Mode::Graveyard { sel: 0 };
+                        }
+                    }
                     _ => {}
                 }
             }
+            Mode::Choose {
+                options,
+                optional,
+                sel,
+                ..
+            } => match key.code {
+                _ if up || down => step(sel, options.len() + usize::from(*optional), up),
+                KeyCode::Enter => {
+                    let card = options.get(*sel).copied();
+                    self.act(Action::ChooseCard { card });
+                }
+                KeyCode::Esc if *optional => self.act(Action::ChooseCard { card: None }),
+                _ => {}
+            },
+            Mode::Graveyard { sel } => match key.code {
+                _ if up || down => step(sel, graveyard_entries(&view).len(), up),
+                KeyCode::Enter => {
+                    let Some((owner, card)) = graveyard_entries(&view).get(*sel).cloned() else {
+                        return;
+                    };
+                    if owner == view.you && self.is_playable(card.id) {
+                        self.mode = Mode::Idle;
+                        self.play_card(&view, &card);
+                    } else {
+                        self.status = Some(format!("You can't cast {} right now.", card.name));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('g') => self.mode = Mode::Idle,
+                _ => {}
+            },
             Mode::Target { card, targets, sel } => match key.code {
                 _ if up || down => step(sel, targets.len(), up),
                 KeyCode::Enter => {
@@ -428,15 +502,25 @@ impl App {
     }
 
     fn play_selected(&mut self, view: &GameView) {
-        let Prompt::Priority { plays } = &view.prompt else {
+        if !matches!(view.prompt, Prompt::Priority { .. }) {
             self.status = Some("It isn't your priority.".into());
             return;
-        };
+        }
         if self.focus != Focus::Hand {
             self.status = Some("Select a card in your hand (Tab) to play it.".into());
             return;
         }
         let Some(card) = view.hand.get(self.hand_sel) else {
+            return;
+        };
+        self.play_card(view, card);
+    }
+
+    /// Plays `card` (from hand, or from the graveyard with flashback), asking for
+    /// a target first if it needs one.
+    fn play_card(&mut self, view: &GameView, card: &CardView) {
+        let Prompt::Priority { plays } = &view.prompt else {
+            self.status = Some("It isn't your priority.".into());
             return;
         };
         let Some(play) = plays.iter().find(|p| p.card == card.id) else {
@@ -462,6 +546,16 @@ impl App {
     pub fn is_playable(&self, id: ObjectId) -> bool {
         matches!(&self.view, Some(GameView { prompt: Prompt::Priority { plays }, .. }) if plays.iter().any(|p| p.card == id))
     }
+}
+
+/// Every card in every graveyard, yours first, with its owner.
+pub fn graveyard_entries(view: &GameView) -> Vec<(PlayerId, CardView)> {
+    let mut players: Vec<_> = view.players.iter().collect();
+    players.sort_by_key(|p| p.id != view.you);
+    players
+        .into_iter()
+        .flat_map(|p| p.graveyard.iter().map(move |c| (p.id, c.clone())))
+        .collect()
 }
 
 fn step(sel: &mut usize, len: usize, up: bool) {

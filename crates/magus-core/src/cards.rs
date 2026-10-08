@@ -5,7 +5,7 @@ use crate::card::Effect::*;
 use crate::card::Keyword::*;
 use crate::card::Who::{EachOpponent, You};
 use crate::card::{
-    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, Trigger,
+    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, Trigger, Whose,
 };
 use crate::mana::Color;
 
@@ -19,6 +19,7 @@ const fn land(key: &'static str, name: &'static str, color: Color) -> CardDef {
         keywords: &[],
         effects: &[],
         abilities: &[],
+        flashback: None,
     }
 }
 
@@ -42,6 +43,7 @@ const fn creature(
         keywords,
         effects: &[],
         abilities,
+        flashback: None,
     }
 }
 
@@ -61,6 +63,7 @@ const fn spell(
         keywords: &[],
         effects,
         abilities: &[],
+        flashback: None,
     }
 }
 
@@ -70,6 +73,14 @@ const fn enters(effects: &'static [Effect]) -> Ability {
         when: Trigger::Enters,
         only_if: None,
         effects,
+    }
+}
+
+/// `card`, which can also be cast from the graveyard for `cost`.
+const fn flashback(card: CardDef, cost: &'static str) -> CardDef {
+    CardDef {
+        flashback: Some(cost),
+        ..card
     }
 }
 
@@ -153,12 +164,27 @@ pub static CARDS: &[CardDef] = &[
         &[Pump {
             power: 2,
             toughness: 2,
+            whose: Whose::Anyone,
         }],
     ),
-    spell("judgment-ray", "Judgment Ray", "3W", Sorcery, &[Destroy]),
+    spell(
+        "judgment-ray",
+        "Judgment Ray",
+        "3W",
+        Sorcery,
+        &[Destroy {
+            whose: Whose::Anyone,
+        }],
+    ),
     // Saves a creature from removal (the spell loses track of it) or reuses
     // its "enters" ability.
-    spell("veilstep", "Veilstep", "1W", Instant, &[Blink]),
+    spell(
+        "veilstep",
+        "Veilstep",
+        "1W",
+        Instant,
+        &[Blink { whose: Whose::You }],
+    ),
     // Blue: fliers, card draw, tricks
     creature(
         "skyward-kestrel",
@@ -215,9 +241,19 @@ pub static CARDS: &[CardDef] = &[
         "Dissolve Thought",
         "UU",
         Instant,
-        &[Counter],
+        &[Counter {
+            whose: Whose::Anyone,
+        }],
     ),
-    spell("undertow", "Undertow", "1U", Instant, &[Bounce]),
+    spell(
+        "undertow",
+        "Undertow",
+        "1U",
+        Instant,
+        &[Bounce {
+            whose: Whose::Anyone,
+        }],
+    ),
     spell(
         "glimpse-beyond",
         "Glimpse Beyond",
@@ -269,13 +305,21 @@ pub static CARDS: &[CardDef] = &[
         &[],
         &[],
     ),
-    spell("grasp-of-ruin", "Grasp of Ruin", "1BB", Instant, &[Destroy]),
+    spell(
+        "grasp-of-ruin",
+        "Grasp of Ruin",
+        "1BB",
+        Instant,
+        &[Destroy {
+            whose: Whose::Anyone,
+        }],
+    ),
     spell(
         "call-from-the-mire",
         "Call from the Mire",
         "3B",
         Sorcery,
-        &[ReturnToBattlefield],
+        &[ReturnToBattlefield { whose: Whose::You }],
     ),
     // Weak to cast, strong to bring back with Call from the Mire.
     creature(
@@ -303,6 +347,7 @@ pub static CARDS: &[CardDef] = &[
             Damage {
                 amount: 2,
                 target: ANY,
+                whose: Whose::Anyone,
             },
             GainLife {
                 who: You,
@@ -377,6 +422,21 @@ pub static CARDS: &[CardDef] = &[
         &[Flying, Haste],
         &[],
     ),
+    // A second burn spell later in the game, from the graveyard.
+    flashback(
+        spell(
+            "sparkfall",
+            "Sparkfall",
+            "1R",
+            Instant,
+            &[Damage {
+                amount: 2,
+                target: ANY,
+                whose: Whose::Anyone,
+            }],
+        ),
+        "2R",
+    ),
     spell(
         "flicker-bolt",
         "Flicker Bolt",
@@ -385,6 +445,7 @@ pub static CARDS: &[CardDef] = &[
         &[Damage {
             amount: 2,
             target: ANY,
+            whose: Whose::Anyone,
         }],
     ),
     spell(
@@ -395,6 +456,7 @@ pub static CARDS: &[CardDef] = &[
         &[Damage {
             amount: 3,
             target: ANY,
+            whose: Whose::Anyone,
         }],
     ),
     spell(
@@ -405,6 +467,7 @@ pub static CARDS: &[CardDef] = &[
         &[Pump {
             power: 3,
             toughness: 0,
+            whose: Whose::Anyone,
         }],
     ),
     // Green: big bodies
@@ -458,6 +521,7 @@ pub static CARDS: &[CardDef] = &[
         &[Pump {
             power: 3,
             toughness: 3,
+            whose: Whose::Anyone,
         }],
     ),
     spell(
@@ -473,12 +537,21 @@ pub static CARDS: &[CardDef] = &[
             Draw { who: You, count: 1 },
         ],
     ),
+    // Cheats a big creature in early, or brings in one that rewards not
+    // being cast (Gravecall Wraith).
+    spell(
+        "beckon-the-wild",
+        "Beckon the Wild",
+        "2G",
+        Sorcery,
+        &[PutFromHand],
+    ),
     spell(
         "mossgrave-recovery",
         "Mossgrave Recovery",
         "1G",
         Sorcery,
-        &[ReturnToHand],
+        &[ReturnToHand { whose: Whose::You }],
     ),
 ];
 
@@ -496,7 +569,9 @@ pub struct DeckList {
 
 impl DeckList {
     pub fn size(&self) -> u32 {
-        self.cards.iter().map(|(_, n)| n).sum()
+        self.cards
+            .iter()
+            .fold(0, |sum, (_, n)| sum.saturating_add(*n))
     }
 }
 
@@ -512,7 +587,8 @@ pub static DECKS: &[DeckList] = &[
             ("cinderhound", 4),
             ("grovekin", 2),
             ("mossgrave-recovery", 2),
-            ("forgeheart-brute", 4),
+            ("forgeheart-brute", 2),
+            ("beckon-the-wild", 2),
             ("thornback-boar", 4),
             ("canopy-spider", 4),
             ("ironbark-behemoth", 4),
@@ -571,7 +647,8 @@ pub static DECKS: &[DeckList] = &[
             ("mistwing-drake", 4),
             ("volcanic-ogre", 4),
             ("ashen-wyrm", 4),
-            ("flicker-bolt", 4),
+            ("flicker-bolt", 2),
+            ("sparkfall", 2),
             ("glimpse-beyond", 4),
             ("dissolve-thought", 4),
         ],

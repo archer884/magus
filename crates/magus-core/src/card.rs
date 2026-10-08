@@ -44,8 +44,74 @@ pub enum TargetKind {
     Creature,
     Player,
     Spell,
-    /// A creature card in the graveyard of whoever controls the spell.
-    CreatureCardInYourGraveyard,
+    /// A creature card in a graveyard.
+    CreatureCardInGraveyard,
+}
+
+/// Whose things a spell may target, from its controller's point of view:
+/// who controls the creature or spell, whose graveyard the card is in, or
+/// which player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Whose {
+    #[default]
+    Anyone,
+    You,
+    Opponent,
+}
+
+impl Whose {
+    fn you() -> Whose {
+        Whose::You
+    }
+}
+
+/// What a spell targets: a kind of thing, and whose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetSpec {
+    pub kind: TargetKind,
+    pub whose: Whose,
+}
+
+impl TargetSpec {
+    /// The target as a noun phrase, e.g. "target creature an opponent controls".
+    pub fn describe(self) -> String {
+        let suffix = |yours: &str, theirs: &str| match self.whose {
+            Whose::Anyone => String::new(),
+            Whose::You => format!(" {yours}"),
+            Whose::Opponent => format!(" {theirs}"),
+        };
+        match self.kind {
+            TargetKind::Any => match self.whose {
+                Whose::Opponent => "target opponent or creature an opponent controls".into(),
+                _ => "any target".into(),
+            },
+            TargetKind::Player => match self.whose {
+                Whose::Opponent => "target opponent".into(),
+                _ => "target player".into(),
+            },
+            TargetKind::Creature => {
+                format!(
+                    "target creature{}",
+                    suffix("you control", "an opponent controls")
+                )
+            }
+            TargetKind::Spell => {
+                format!(
+                    "target spell{}",
+                    suffix("you control", "an opponent controls")
+                )
+            }
+            TargetKind::CreatureCardInGraveyard => format!(
+                "target creature card from {}",
+                match self.whose {
+                    Whose::Anyone => "a graveyard",
+                    Whose::You => "your graveyard",
+                    Whose::Opponent => "an opponent's graveyard",
+                }
+            ),
+        }
+    }
 }
 
 /// Which player(s) an untargeted effect applies to, from the point of view of
@@ -90,14 +156,27 @@ pub enum Effect {
     Damage {
         amount: i32,
         target: TargetKind,
+        #[serde(default)]
+        whose: Whose,
     },
-    Destroy,
-    Bounce,
+    Destroy {
+        #[serde(default)]
+        whose: Whose,
+    },
+    Bounce {
+        #[serde(default)]
+        whose: Whose,
+    },
     Pump {
         power: i32,
         toughness: i32,
+        #[serde(default)]
+        whose: Whose,
     },
-    Counter,
+    Counter {
+        #[serde(default)]
+        whose: Whose,
+    },
     Draw {
         who: Who,
         count: u32,
@@ -120,32 +199,47 @@ pub enum Effect {
     },
     /// Puts the targeted card from a graveyard onto the battlefield under the
     /// spell's controller's control. It enters, but isn't cast.
-    ReturnToBattlefield,
+    ReturnToBattlefield {
+        #[serde(default = "Whose::you")]
+        whose: Whose,
+    },
     /// Returns the targeted card from a graveyard to its owner's hand.
-    ReturnToHand,
+    ReturnToHand {
+        #[serde(default = "Whose::you")]
+        whose: Whose,
+    },
     /// Exiles the targeted creature and immediately returns it under its
     /// owner's control, as a new object: spells and abilities aimed at it lose
     /// track of it, and it enters again.
-    Blink,
+    Blink {
+        #[serde(default)]
+        whose: Whose,
+    },
+    /// "You may put a creature card from your hand onto the battlefield." The
+    /// player chooses while the spell or ability resolves.
+    PutFromHand,
 }
 
 impl Effect {
-    pub fn target(&self) -> Option<TargetKind> {
-        match self {
-            Effect::Damage { target, .. } => Some(*target),
-            Effect::Destroy | Effect::Bounce | Effect::Pump { .. } | Effect::Blink => {
-                Some(TargetKind::Creature)
+    pub fn target(&self) -> Option<TargetSpec> {
+        let (kind, whose) = match *self {
+            Effect::Damage { target, whose, .. } => (target, whose),
+            Effect::Destroy { whose }
+            | Effect::Bounce { whose }
+            | Effect::Pump { whose, .. }
+            | Effect::Blink { whose } => (TargetKind::Creature, whose),
+            Effect::ReturnToBattlefield { whose } | Effect::ReturnToHand { whose } => {
+                (TargetKind::CreatureCardInGraveyard, whose)
             }
-            Effect::ReturnToBattlefield | Effect::ReturnToHand => {
-                Some(TargetKind::CreatureCardInYourGraveyard)
-            }
-            Effect::Counter => Some(TargetKind::Spell),
+            Effect::Counter { whose } => (TargetKind::Spell, whose),
             Effect::Draw { .. }
             | Effect::GainLife { .. }
             | Effect::LoseLife { .. }
             | Effect::DamagePlayers { .. }
-            | Effect::LoseGame { .. } => None,
-        }
+            | Effect::LoseGame { .. }
+            | Effect::PutFromHand => return None,
+        };
+        Some(TargetSpec { kind, whose })
     }
 
     /// The players this effect applies to, if it names them with a [`Who`].
@@ -157,36 +251,27 @@ impl Effect {
             | Effect::DamagePlayers { who, .. }
             | Effect::LoseGame { who } => Some(who),
             Effect::Damage { .. }
-            | Effect::Destroy
-            | Effect::Bounce
+            | Effect::Destroy { .. }
+            | Effect::Bounce { .. }
             | Effect::Pump { .. }
-            | Effect::Counter
-            | Effect::ReturnToBattlefield
-            | Effect::ReturnToHand
-            | Effect::Blink => None,
+            | Effect::Counter { .. }
+            | Effect::ReturnToBattlefield { .. }
+            | Effect::ReturnToHand { .. }
+            | Effect::Blink { .. }
+            | Effect::PutFromHand => None,
         }
     }
 
     pub fn describe(&self) -> String {
+        let target = self.target().map(TargetSpec::describe).unwrap_or_default();
         match *self {
-            Effect::Damage { amount, target } => {
-                let what = match target {
-                    TargetKind::Any => "any target",
-                    TargetKind::Creature => "target creature",
-                    TargetKind::Player => "target player",
-                    TargetKind::Spell => "target spell",
-                    TargetKind::CreatureCardInYourGraveyard => {
-                        "target creature card in your graveyard"
-                    }
-                };
-                format!("deal {amount} damage to {what}")
-            }
-            Effect::Destroy => "destroy target creature".into(),
-            Effect::Bounce => "return target creature to its owner's hand".into(),
-            Effect::Pump { power, toughness } => {
-                format!("target creature gets +{power}/+{toughness} until end of turn")
-            }
-            Effect::Counter => "counter target spell".into(),
+            Effect::Damage { amount, .. } => format!("deal {amount} damage to {target}"),
+            Effect::Destroy { .. } => format!("destroy {target}"),
+            Effect::Bounce { .. } => format!("return {target} to its owner's hand"),
+            Effect::Pump {
+                power, toughness, ..
+            } => format!("{target} gets +{power}/+{toughness} until end of turn"),
+            Effect::Counter { .. } => format!("counter {target}"),
             // "You draw a card" reads as "draw a card" on real cards.
             Effect::Draw { who, count } => {
                 let cards = match count {
@@ -210,15 +295,20 @@ impl Effect {
             Effect::LoseGame { who } => {
                 format!("{} {} the game", who.noun(), who.conjugate("lose"))
             }
-            Effect::ReturnToBattlefield => {
-                "return target creature card from your graveyard to the battlefield".into()
+            Effect::ReturnToBattlefield { whose } => match whose {
+                Whose::You => format!("return {target} to the battlefield"),
+                _ => format!("put {target} onto the battlefield under your control"),
+            },
+            Effect::ReturnToHand { whose } => match whose {
+                Whose::You => format!("return {target} to your hand"),
+                _ => format!("return {target} to its owner's hand"),
+            },
+            Effect::Blink { .. } => format!(
+                "exile {target}, then return it to the battlefield under its owner's control"
+            ),
+            Effect::PutFromHand => {
+                "you may put a creature card from your hand onto the battlefield".into()
             }
-            Effect::ReturnToHand => {
-                "return target creature card from your graveyard to your hand".into()
-            }
-            Effect::Blink => "exile target creature, then return it to the battlefield under \
-                              its owner's control"
-                .into(),
         }
     }
 }
@@ -260,12 +350,14 @@ impl Trigger {
 #[serde(rename_all = "snake_case")]
 pub enum CastZone {
     Hand,
+    Graveyard,
 }
 
 impl CastZone {
     fn describe(self) -> &'static str {
         match self {
             CastZone::Hand => "your hand",
+            CastZone::Graveyard => "your graveyard",
         }
     }
 }
@@ -360,6 +452,9 @@ pub struct CardDef {
     pub effects: &'static [Effect],
     /// Triggered abilities of a permanent. Empty for instants and sorceries.
     pub abilities: &'static [Ability],
+    /// For instants and sorceries: a cost for casting this card from its
+    /// owner's graveyard, after which it's exiled instead of going back.
+    pub flashback: Option<&'static str>,
 }
 
 impl CardDef {
@@ -402,7 +497,7 @@ impl CardDef {
     }
 
     /// What casting this card targets, if anything. Abilities never target.
-    pub fn spell_target(&self) -> Option<TargetKind> {
+    pub fn spell_target(&self) -> Option<TargetSpec> {
         match self.kind {
             CardKind::Instant | CardKind::Sorcery => self.effects.iter().find_map(Effect::target),
             CardKind::Land(_) | CardKind::Creature { .. } => None,
@@ -422,6 +517,14 @@ impl CardDef {
         }
         if let Err(e) = ManaCost::try_parse(self.cost) {
             problems.push(e);
+        }
+        if let Some(cost) = self.flashback {
+            if let Err(e) = ManaCost::try_parse(cost) {
+                problems.push(format!("flashback: {e}"));
+            }
+            if !matches!(self.kind, CardKind::Instant | CardKind::Sorcery) {
+                problems.push("only instants and sorceries can have flashback".into());
+            }
         }
         let targeted = self.effects.iter().filter(|e| e.target().is_some()).count();
         match self.kind {
@@ -465,13 +568,22 @@ impl CardDef {
             matches!(
                 e,
                 Effect::Damage {
-                    target: TargetKind::Spell | TargetKind::CreatureCardInYourGraveyard,
+                    target: TargetKind::Spell | TargetKind::CreatureCardInGraveyard,
                     ..
                 }
             )
         });
         if damages_non_creature {
             problems.push("damage can only target `any`, `creature` or `player`".into());
+        }
+        let targets_yourself = self.effects.iter().filter_map(Effect::target).any(|t| {
+            t.whose == Whose::You && matches!(t.kind, TargetKind::Any | TargetKind::Player)
+        });
+        if targets_yourself {
+            problems.push(
+                "`whose = \"you\"` can't apply to a player target (use an untargeted effect)"
+                    .into(),
+            );
         }
         if self
             .effects
@@ -534,6 +646,13 @@ impl CardDef {
             lines.push(format!("{first}{}.", chars.as_str()));
         }
         lines.extend(self.abilities.iter().map(Ability::describe));
+        if let Some(cost) = self.flashback {
+            lines.push(format!(
+                "Flashback {} (You may cast this card from your graveyard for its flashback cost. \
+                 Then exile it.)",
+                ManaCost::parse(cost)
+            ));
+        }
         lines.join("\n")
     }
 }
@@ -557,7 +676,9 @@ mod tests {
                     who: Who::EachOpponent,
                     amount: 2,
                 },
-                Effect::Destroy,
+                Effect::Destroy {
+                    whose: Whose::Opponent,
+                },
             ],
         };
         assert_eq!(
@@ -568,9 +689,24 @@ mod tests {
                 "only_if": { "type": "not_cast_from", "zone": "hand" },
                 "effects": [
                     { "type": "damage_players", "who": "each_opponent", "amount": 2 },
-                    { "type": "destroy" },
+                    { "type": "destroy", "whose": "opponent" },
                 ],
             })
+        );
+        // `whose` may be left out. Returning from a graveyard defaults to yours.
+        let effects: Vec<Effect> = serde_json::from_value(json!([
+            { "type": "destroy" },
+            { "type": "return_to_hand" },
+        ]))
+        .unwrap();
+        assert_eq!(
+            effects,
+            [
+                Effect::Destroy {
+                    whose: Whose::Anyone
+                },
+                Effect::ReturnToHand { whose: Whose::You },
+            ]
         );
         let kind: CardKind =
             serde_json::from_value(json!({ "creature": { "power": 2, "toughness": 3 } })).unwrap();
@@ -589,12 +725,15 @@ mod tests {
             Effect::Damage {
                 amount: 3,
                 target: TargetKind::Any,
+                whose: Whose::Anyone,
             },
             Effect::Draw {
                 who: Who::You,
                 count: 2,
             },
-            Effect::Counter,
+            Effect::Counter {
+                whose: Whose::Opponent,
+            },
         ];
         let text = serde_json::to_string(&effects).unwrap();
         let back: Vec<Effect> = serde_json::from_str(&text).unwrap();

@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 use magus_core::cards::DeckList;
 use magus_core::{Action, CardPool, Game, Pack, PlayerId};
 use magus_protocol::{
-    ClientMsg, LineReader, PROTOCOL_VERSION, ServerMsg, deck_infos, decode, encode,
+    ClientMsg, CustomDeck, LineReader, PROTOCOL_VERSION, ServerMsg, deck_infos, decode, encode,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -19,8 +19,30 @@ const MAX_NAME_LEN: usize = 24;
 
 struct Seat {
     name: String,
-    deck: &'static DeckList,
+    deck: SeatDeck,
     out: mpsc::UnboundedSender<ServerMsg>,
+}
+
+/// The deck a player brought: one the server offers, or their own list.
+enum SeatDeck {
+    Offered(&'static DeckList),
+    Custom(CustomDeck),
+}
+
+impl SeatDeck {
+    fn name(&self) -> &str {
+        match self {
+            SeatDeck::Offered(deck) => deck.name,
+            SeatDeck::Custom(deck) => &deck.name,
+        }
+    }
+
+    fn entries(&self) -> Vec<(&str, u32)> {
+        match self {
+            SeatDeck::Offered(deck) => deck.cards.to_vec(),
+            SeatDeck::Custom(deck) => deck.cards.iter().map(|(k, &n)| (k.as_str(), n)).collect(),
+        }
+    }
 }
 
 struct WaitingSeat {
@@ -74,6 +96,22 @@ pub async fn serve(listener: TcpListener, pool: Arc<CardPool>) -> std::io::Resul
     }
 }
 
+/// A player-supplied name, trimmed, without control characters, and at most
+/// `MAX_NAME_LEN` characters; `default` if nothing is left.
+fn clean_name(name: &str, default: &str) -> String {
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_LEN)
+        .collect();
+    if name.is_empty() {
+        default.to_string()
+    } else {
+        name
+    }
+}
+
 async fn next_msg(reader: &mut LineReader) -> anyhow::Result<Option<ClientMsg>> {
     match reader.next().await {
         None => Ok(None),
@@ -106,17 +144,7 @@ async fn handle_connection(
                 let _ = out.send(ServerMsg::Error { message });
                 return Ok(());
             }
-            let name: String = name
-                .trim()
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(MAX_NAME_LEN)
-                .collect();
-            if name.is_empty() {
-                "Anonymous".to_string()
-            } else {
-                name
-            }
+            clean_name(&name, "Anonymous")
         }
         Some(_) => bail!("expected hello"),
         None => return Ok(()),
@@ -127,11 +155,25 @@ async fn handle_connection(
 
     let (room, deck) = loop {
         match next_msg(&mut reader).await? {
+            Some(ClientMsg::JoinCustom { room, mut deck }) => {
+                let problems =
+                    pool.decklist_problems(deck.cards.iter().map(|(k, &n)| (k.as_str(), n)));
+                if problems.is_empty() {
+                    deck.name = clean_name(&deck.name, "Custom deck");
+                    break (room.trim().to_lowercase(), SeatDeck::Custom(deck));
+                }
+                let _ = out.send(ServerMsg::Error {
+                    message: format!("this server can't use your deck: {}", problems.join("; ")),
+                });
+            }
             Some(ClientMsg::Join { room, deck }) => match pool.deck(&deck) {
-                Some(deck) => break (room.trim().to_lowercase(), deck),
+                Some(deck) => break (room.trim().to_lowercase(), SeatDeck::Offered(deck)),
                 None => {
                     let _ = out.send(ServerMsg::Error {
-                        message: format!("unknown deck {deck:?}"),
+                        message: format!(
+                            "this server has no deck called {deck:?} (to play your own deck, \
+                             give the path to its file)"
+                        ),
                     });
                 }
             },
@@ -143,7 +185,7 @@ async fn handle_connection(
             None => return Ok(()),
         }
     };
-    tracing::info!(%name, %room, deck = deck.key, "player joined");
+    tracing::info!(%name, %room, deck = deck.name(), "player joined");
 
     let me = Seat {
         name,
@@ -247,8 +289,12 @@ async fn run_game(
     mut inputs: mpsc::UnboundedReceiver<(PlayerId, GameInput)>,
 ) {
     let names: Vec<String> = seats.iter().map(|s| s.name.clone()).collect();
-    let players: Vec<(String, &'static DeckList)> =
-        seats.iter().map(|s| (s.name.clone(), s.deck)).collect();
+    let decks: Vec<Vec<(&str, u32)>> = seats.iter().map(|s| s.deck.entries()).collect();
+    let players: Vec<(String, &[(&str, u32)])> = seats
+        .iter()
+        .zip(&decks)
+        .map(|(s, d)| (s.name.clone(), d.as_slice()))
+        .collect();
     let mut game = Game::new(&pool, &players, rand::random());
     tracing::info!(players = %names.join(" vs "), "game started");
 
@@ -358,5 +404,95 @@ mod tests {
             err.contains(r#"card "glass-golem": a creature needs both power and toughness"#),
             "{err}"
         );
+    }
+
+    /// Connects to `addr`, says hello, and sends `join`; returns the reply.
+    async fn join_with(addr: &str, join: ClientMsg) -> ServerMsg {
+        let (tx, mut rx) = magus_protocol::connect(addr).await.unwrap();
+        tx.send(ClientMsg::Hello {
+            name: "Tester".into(),
+            protocol: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        let Some(ServerMsg::Welcome { .. }) = rx.recv().await else {
+            panic!("no welcome");
+        };
+        tx.send(join).unwrap();
+        let reply = rx.recv().await.unwrap();
+        drop(tx);
+        reply
+    }
+
+    #[tokio::test]
+    async fn custom_decks_are_checked_against_the_servers_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve(listener, Arc::new(CardPool::builtin())));
+        let deck = |cards: &[(&str, u32)]| CustomDeck {
+            name: "Mine".into(),
+            cards: cards.iter().map(|&(k, n)| (k.to_string(), n)).collect(),
+        };
+        let custom = |cards: &[(&str, u32)]| ClientMsg::JoinCustom {
+            room: "r".into(),
+            deck: deck(cards),
+        };
+
+        let reply = join_with(
+            &addr,
+            custom(&[("blaze", 5), ("gullwing-courier", 4), ("crag", 51)]),
+        )
+        .await;
+        let ServerMsg::Error { message } = reply else {
+            panic!("expected an error, got {reply:?}");
+        };
+        assert_eq!(
+            message,
+            "this server can't use your deck: 5 copies of Blaze, but at most 4 are allowed \
+             (basic lands are exempt); unknown card \"gullwing-courier\""
+        );
+
+        let reply = join_with(&addr, custom(&[("blaze", 4), ("crag", 56)])).await;
+        assert_eq!(reply, ServerMsg::Waiting { room: "r".into() });
+    }
+
+    #[tokio::test]
+    async fn two_custom_decks_start_a_game() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve(listener, Arc::new(CardPool::builtin())));
+        let mut players = Vec::new();
+        for (name, card, land) in [("A", "blaze", "crag"), ("B", "grovekin", "thicket")] {
+            let (tx, rx) = magus_protocol::connect(&addr).await.unwrap();
+            tx.send(ClientMsg::Hello {
+                name: name.into(),
+                protocol: PROTOCOL_VERSION,
+            })
+            .unwrap();
+            let cards = [(card.to_string(), 4), (land.to_string(), 56)];
+            tx.send(ClientMsg::JoinCustom {
+                room: "pair".into(),
+                deck: CustomDeck {
+                    name: format!("{name}'s deck"),
+                    cards: cards.into_iter().collect(),
+                },
+            })
+            .unwrap();
+            players.push((tx, rx));
+        }
+        for (_, rx) in &mut players {
+            let mut started = false;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ServerMsg::Started { .. } => started = true,
+                    ServerMsg::State { view } => {
+                        assert!(started);
+                        assert_eq!(view.hand.len() + view.players[view.you].library_size, 60);
+                        break;
+                    }
+                    ServerMsg::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+        }
     }
 }

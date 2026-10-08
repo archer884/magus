@@ -13,9 +13,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, Focus, Mode, Screen};
+use crate::app::{App, Focus, Mode, Screen, graveyard_entries};
 
-const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
+pub(crate) const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -51,7 +51,7 @@ fn centered_message(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), middle);
 }
 
-fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
+pub(crate) fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -63,19 +63,57 @@ fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     }
 }
 
-fn color_of(colors: &[Color]) -> Tc {
+pub(crate) fn color_of(colors: &[Color]) -> Tc {
     match colors {
         [] => Tc::Gray,
-        [Color::White] => Tc::White,
-        [Color::Blue] => Tc::LightBlue,
-        [Color::Black] => Tc::Magenta,
-        [Color::Red] => Tc::LightRed,
-        [Color::Green] => Tc::LightGreen,
+        [color] => mana_color(*color),
         _ => Tc::Yellow,
     }
 }
 
-fn card_name(card: &CardView) -> Span<'static> {
+/// The terminal color for a color of mana. Black is shown as magenta, which
+/// stays readable on a dark background.
+fn mana_color(color: Color) -> Tc {
+    match color {
+        Color::White => Tc::White,
+        Color::Blue => Tc::LightBlue,
+        Color::Black => Tc::Magenta,
+        Color::Red => Tc::LightRed,
+        Color::Green => Tc::LightGreen,
+    }
+}
+
+/// Splits text into spans, coloring each colored mana symbol such as `{U}`.
+/// Generic mana (`{2}`) and everything else keep `base`.
+pub(crate) fn mana_text(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        let symbol = &rest[start..start + len + 1];
+        let mut inner = symbol[1..symbol.len() - 1].chars();
+        let color = match (inner.next().and_then(Color::from_symbol), inner.next()) {
+            (Some(color), None) => Some(color),
+            _ => None,
+        };
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base));
+        }
+        spans.push(match color {
+            Some(color) => Span::styled(symbol.to_string(), base.fg(mana_color(color)).bold()),
+            None => Span::styled(symbol.to_string(), base),
+        });
+        rest = &rest[start + len + 1..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
+pub(crate) fn card_name(card: &CardView) -> Span<'static> {
     Span::styled(
         card.name.clone(),
         Style::new().fg(color_of(&card.colors)).bold(),
@@ -165,6 +203,18 @@ fn draw_game(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
     if let Mode::Target { targets, sel, card } = &app.mode {
         draw_target_popup(frame, area, view, *card, targets, *sel);
     }
+    if let Mode::Graveyard { sel } = &app.mode {
+        draw_graveyard_popup(frame, area, app, view, *sel);
+    }
+    if let Mode::Choose {
+        reason,
+        options,
+        optional,
+        sel,
+    } = &app.mode
+    {
+        draw_choose_popup(frame, area, view, reason, options, *optional, *sel);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &GameView) {
@@ -206,10 +256,15 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
             Style::new().fg(Tc::LightRed).bold(),
         ),
         Span::raw(format!(
-            "  hand {} · library {} · graveyard {} ",
+            "  hand {} · library {} · graveyard {}{} ",
             player.hand_size,
             player.library_size,
-            player.graveyard.len()
+            player.graveyard.len(),
+            if player.exile.is_empty() {
+                String::new()
+            } else {
+                format!(" · exile {}", player.exile.len())
+            }
         ))
         .dark_gray(),
     ];
@@ -260,7 +315,7 @@ fn draw_player(frame: &mut Frame, area: Rect, app: &App, view: &GameView, p: Pla
             Mode::Target { targets, sel, .. } => {
                 ("", targets.get(*sel) == Some(&Target::Permanent(id)))
             }
-            Mode::Discard { .. } => ("", false),
+            Mode::Discard { .. } | Mode::Graveyard { .. } | Mode::Choose { .. } => ("", false),
         };
         let mut line = permanent_line(view, perm, marker);
         if let Mode::Attack {
@@ -303,14 +358,11 @@ fn lands_line(view: &GameView, p: PlayerId) -> Line<'static> {
         .iter()
         .filter(|perm| perm.controller == p && perm.card.is_land)
     {
-        let color = match perm.card.text.as_str() {
-            t if t.contains("{W}") => Tc::White,
-            t if t.contains("{U}") => Tc::LightBlue,
-            t if t.contains("{B}") => Tc::Magenta,
-            t if t.contains("{R}") => Tc::LightRed,
-            t if t.contains("{G}") => Tc::LightGreen,
-            _ => Tc::Gray,
-        };
+        // Lands are colorless; color them by the mana they make.
+        let color = Color::ALL
+            .into_iter()
+            .find(|c| perm.card.text.contains(&format!("{{{}}}", c.symbol())))
+            .map_or(Tc::Gray, mana_color);
         let entry = counts
             .entry(perm.card.name.clone())
             .or_insert((0, 0, color));
@@ -432,12 +484,10 @@ fn draw_hand(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
             if !playable && !discarding {
                 name = name.patch_style(Style::new().add_modifier(Modifier::DIM));
             }
-            ListItem::new(Line::from(vec![
-                marker,
-                name,
-                Span::raw(format!(" {}", card.cost)),
-                format!("  {}", card.type_line).dark_gray(),
-            ]))
+            let mut spans = vec![marker, name, Span::raw(" ")];
+            spans.extend(mana_text(&card.cost, Style::new()));
+            spans.push(format!("  {}", card.type_line).dark_gray());
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default().with_selected(focused.then_some(app.hand_sel));
@@ -474,6 +524,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
             "Declare blockers".bold().into(),
             "↑↓: creature · Space/←→: choose attacker to block · Enter: confirm".into(),
         ),
+        (Mode::Choose { optional, .. }, _) => (
+            "Choose a card".bold().into(),
+            if *optional {
+                "↑↓: select · Enter: choose · Esc: choose nothing".into()
+            } else {
+                "↑↓: select · Enter: choose".into()
+            },
+        ),
+        (Mode::Graveyard { .. }, _) => (
+            "Graveyards".bold().into(),
+            "↑↓: select · Enter: cast with flashback (●) · Esc/g: close".into(),
+        ),
         (Mode::Discard { count, .. }, _) => (
             format!("Discard down to hand size: choose {count}")
                 .bold()
@@ -486,19 +548,28 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
             } else {
                 "Respond to the stack, or pass to let it resolve".to_string()
             };
-            let hint = if plays.is_empty() {
-                ""
-            } else {
+            let hint = if plays.iter().any(|p| view.hand_card(p.card).is_some()) {
                 " · Enter: play ●"
+            } else {
+                ""
+            };
+            let from_graveyard = plays
+                .iter()
+                .filter(|p| view.graveyard_card(p.card).is_some())
+                .count();
+            let graveyards = if from_graveyard > 0 {
+                format!("g: graveyards ({from_graveyard} castable)")
+            } else {
+                "g: graveyards".to_string()
             };
             (
                 what.bold().green().into(),
-                format!("Space: pass{hint} · Tab: inspect · {control} · q: quit"),
+                format!("Space: pass{hint} · Tab: inspect · {graveyards} · {control} · q: quit"),
             )
         }
         (Mode::Idle, Prompt::Waiting { on }) => (
             Line::from(format!("Waiting for {}…", view.player_name(*on))).dark_gray(),
-            format!("Tab: inspect · {control} · q: quit"),
+            format!("Tab: inspect · g: graveyards · {control} · q: quit"),
         ),
         (Mode::Idle, _) => (Line::default(), String::new()),
     };
@@ -521,15 +592,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
         );
         return;
     };
-    let mut lines = vec![
-        Line::from(vec![
-            card_name(&card),
-            Span::raw(format!("  {}", card.cost)),
-        ]),
-        Line::from(card.type_line.clone()).italic(),
-        Line::from(""),
-    ];
-    lines.extend(card.text.lines().map(|l| Line::from(l.to_string())));
+    let mut lines = card_lines(&card);
     if let (Some(p), Some(t)) = (card.power, card.toughness) {
         lines.push(Line::from(""));
         let current = view
@@ -558,6 +621,23 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &GameView) {
     );
 }
 
+/// A card's name and cost, type line and rules text, for detail panes.
+pub(crate) fn card_lines(card: &CardView) -> Vec<Line<'static>> {
+    let mut title = vec![card_name(card), Span::raw("  ")];
+    title.extend(mana_text(&card.cost, Style::new()));
+    let mut lines = vec![
+        Line::from(title),
+        Line::from(card.type_line.clone()).italic(),
+        Line::from(""),
+    ];
+    lines.extend(
+        card.text
+            .lines()
+            .map(|l| Line::from(mana_text(l, Style::new()))),
+    );
+    lines
+}
+
 fn draw_log(frame: &mut Frame, area: Rect, view: &GameView) {
     let height = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = view.log[view.log.len().saturating_sub(height)..]
@@ -571,6 +651,99 @@ fn draw_log(frame: &mut Frame, area: Rect, view: &GameView) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).block(panel(" Log ", false)), area);
+}
+
+fn draw_graveyard_popup(frame: &mut Frame, area: Rect, app: &App, view: &GameView, sel: usize) {
+    let entries = graveyard_entries(view);
+    let height = (entries.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let width = 60.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|(owner, card)| {
+            let castable = *owner == view.you && app.is_playable(card.id);
+            let mut spans = vec![
+                if castable {
+                    "● ".green()
+                } else {
+                    "  ".into()
+                },
+                card_name(card),
+                Span::raw(" "),
+            ];
+            spans.extend(mana_text(&card.cost, Style::new()));
+            let whose = if *owner == view.you {
+                "yours".to_string()
+            } else {
+                view.player_name(*owner).to_string()
+            };
+            spans.push(format!("  {whose}").dark_gray());
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(sel));
+    frame.render_widget(Clear, popup);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(" Graveyards (● castable with flashback) ", true))
+            .highlight_style(SELECTED),
+        popup,
+        &mut state,
+    );
+}
+
+fn draw_choose_popup(
+    frame: &mut Frame,
+    area: Rect,
+    view: &GameView,
+    reason: &str,
+    options: &[ObjectId],
+    optional: bool,
+    sel: usize,
+) {
+    let mut items: Vec<ListItem> = options
+        .iter()
+        .filter_map(|&id| view.hand_card(id))
+        .map(|card| {
+            let mut spans = vec![card_name(card), Span::raw(" ")];
+            spans.extend(mana_text(&card.cost, Style::new()));
+            spans.push(format!("  {}", card.type_line).dark_gray());
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    if optional {
+        items.push(ListItem::new(Line::from("(nothing)").dark_gray()));
+    }
+    let width = 64.min(area.width);
+    // Roughly how many lines the reason wraps to; a spare line is harmless.
+    let text_width = width.saturating_sub(2).max(1);
+    let reason_height = (reason.chars().count() as u16).div_ceil(text_width).max(1);
+    let reason = Paragraph::new(reason.to_string()).wrap(Wrap { trim: true });
+    let height = (items.len() as u16 + reason_height + 3).min(area.height.saturating_sub(4));
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = panel(" Choose a card ", true);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [top, _, list] = Layout::vertical([
+        Constraint::Length(reason_height),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    frame.render_widget(reason, top);
+    let mut state = ListState::default().with_selected(Some(sel));
+    frame.render_stateful_widget(List::new(items).highlight_style(SELECTED), list, &mut state);
 }
 
 fn draw_target_popup(
@@ -605,4 +778,39 @@ fn draw_target_popup(
         popup,
         &mut state,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mana_symbols_are_colored() {
+        let spans = mana_text("{2}{U}{U}", Style::new());
+        let parts: Vec<_> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style.fg))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("{2}", None),
+                ("{U}", Some(Tc::LightBlue)),
+                ("{U}", Some(Tc::LightBlue)),
+            ]
+        );
+        let spans = mana_text("Tap: Add {R}.", Style::new());
+        let parts: Vec<_> = spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style.fg))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("Tap: Add ", None),
+                ("{R}", Some(Tc::LightRed)),
+                (".", None)
+            ]
+        );
+    }
 }

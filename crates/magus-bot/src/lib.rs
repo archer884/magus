@@ -83,6 +83,15 @@ fn fallback(view: &GameView) -> Option<Action> {
         Prompt::Discard { count } => Action::Discard {
             cards: view.hand.iter().take(*count).map(|c| c.id).collect(),
         },
+        Prompt::ChooseCard {
+            options, optional, ..
+        } => Action::ChooseCard {
+            card: if *optional {
+                None
+            } else {
+                options.first().copied()
+            },
+        },
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => return None,
     })
 }
@@ -123,6 +132,25 @@ pub fn choose(view: &GameView) -> Option<Action> {
                 cards: hand.iter().take(*count).map(|c| c.id).collect(),
             })
         }
+        // The only choice so far is which creature to put onto the
+        // battlefield: the best one that won't make us lose.
+        Prompt::ChooseCard {
+            options, optional, ..
+        } => {
+            let best = options
+                .iter()
+                .filter_map(|&id| {
+                    let def = cards::card(&view.hand_card(id)?.key)?;
+                    (!loses_on_entering(def)).then_some((id, card_value(def)))
+                })
+                .max_by_key(|(_, value)| *value)
+                .map(|(id, _)| id);
+            let card = match best {
+                None if !*optional => options.first().copied(),
+                best => best,
+            };
+            Some(Action::ChooseCard { card })
+        }
         Prompt::Waiting { .. } | Prompt::GameOver { .. } => None,
     }
 }
@@ -160,7 +188,12 @@ fn choose_play(view: &GameView, plays: &[PlayOption]) -> Action {
     let mut spells: Vec<_> = plays
         .iter()
         .filter(|p| p.kind == PlayKind::Spell)
-        .filter_map(|p| view.hand_card(p.card).map(|c| (p, c)))
+        .filter_map(|p| {
+            let card = view
+                .hand_card(p.card)
+                .or_else(|| Some(view.graveyard_card(p.card)?.1))?;
+            Some((p, card))
+        })
         .collect();
     spells.sort_by_key(|(_, c)| std::cmp::Reverse(c.mana_value));
     for (play, card) in spells {
@@ -213,7 +246,7 @@ fn pick_target(view: &GameView, effects: &[Effect], targets: &[Target]) -> Optio
             let late = view.active != view.you && view.step == Step::End;
             (late || life <= amount).then_some(*opponent)
         }
-        Effect::Destroy | Effect::Bounce => enemy_creatures().max_by_key(|p| threat(p)).map(|p| Target::Permanent(p.card.id)),
+        Effect::Destroy { .. } | Effect::Bounce { .. } => enemy_creatures().max_by_key(|p| threat(p)).map(|p| Target::Permanent(p.card.id)),
         Effect::Pump { .. } => {
             if !matches!(view.step, Step::DeclareBlockers) {
                 return None;
@@ -224,7 +257,7 @@ fn pick_target(view: &GameView, effects: &[Effect], targets: &[Target]) -> Optio
                 .max_by_key(|p| p.power.unwrap_or(0))
                 .map(|p| Target::Permanent(p.card.id))
         }
-        Effect::ReturnToBattlefield | Effect::ReturnToHand => targets
+        Effect::ReturnToBattlefield { .. } | Effect::ReturnToHand { .. } => targets
             .iter()
             .filter_map(|t| match t {
                 Target::GraveyardCard(id) => {
@@ -237,14 +270,14 @@ fn pick_target(view: &GameView, effects: &[Effect], targets: &[Target]) -> Optio
             .max_by_key(|(_, value)| *value)
             .map(|(t, _)| t),
         // Keep it to save a creature: blink it in response to a spell aimed at it.
-        Effect::Blink => view
+        Effect::Blink { .. } => view
             .stack
             .last()
             .filter(|s| s.controller != view.you)
             .and_then(|s| s.target)
             .filter(|t| matches!(t, Target::Permanent(id) if view.permanent(*id).is_some_and(|p| p.controller == view.you)))
             .filter(|t| targets.contains(t)),
-        Effect::Counter => targets
+        Effect::Counter { .. } => targets
             .iter()
             .find(|t| matches!(t, Target::Spell(id) if view.stack_item(*id).is_some_and(|s| s.controller != view.you)))
             .copied(),

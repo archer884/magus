@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::card::{Ability, CardDef, CardKind, Condition, Effect, Keyword, Trigger};
 use crate::cards::{self, DeckList};
@@ -17,42 +17,53 @@ use crate::mana::Color;
 /// Every deck must have exactly this many cards.
 pub const DECK_SIZE: u32 = 60;
 
-/// Cards and decks from outside the engine, as read from a pack file.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// A deck may have at most this many copies of any card except basic lands.
+pub const MAX_COPIES: u32 = 4;
+
+/// Cards and decks from outside the engine, as read from (or written to) a
+/// pack file. A deck saved by the deck builder is a pack with just one deck.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pack {
-    #[serde(default, rename = "card")]
+    #[serde(default, rename = "card", skip_serializing_if = "Vec::is_empty")]
     pub cards: Vec<CardSpec>,
-    #[serde(default, rename = "deck")]
+    #[serde(default, rename = "deck", skip_serializing_if = "Vec::is_empty")]
     pub decks: Vec<DeckSpec>,
 }
 
 /// One card in a pack. Which fields apply depends on `kind`: creatures need
 /// `power` and `toughness`, lands need `mana`, and spells need `effects`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CardSpec {
     pub key: String,
     pub name: String,
     #[serde(rename = "type")]
     pub kind: SpecKind,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cost: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub power: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub toughness: Option<i32>,
     /// For lands, the mana symbol it taps for, e.g. `"R"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mana: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub subtype: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<Keyword>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<Effect>,
-    #[serde(default, rename = "ability")]
+    /// For instants and sorceries, a cost for casting it from the graveyard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flashback: Option<String>,
+    // Last, because TOML writes arrays of tables after plain fields.
+    #[serde(default, rename = "ability", skip_serializing_if = "Vec::is_empty")]
     pub abilities: Vec<AbilitySpec>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpecKind {
     Creature,
@@ -62,18 +73,18 @@ pub enum SpecKind {
 }
 
 /// An owned [`Ability`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AbilitySpec {
     Triggered {
         when: Trigger,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         only_if: Option<Condition>,
         effects: Vec<Effect>,
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeckSpec {
     pub key: String,
@@ -117,6 +128,11 @@ impl CardPool {
 
     pub fn card(&self, key: &str) -> Option<&'static CardDef> {
         self.cards.get(key).copied()
+    }
+
+    /// Every card, in no particular order.
+    pub fn cards(&self) -> impl Iterator<Item = &'static CardDef> + '_ {
+        self.cards.values().copied()
     }
 
     pub fn deck(&self, key: &str) -> Option<&'static DeckList> {
@@ -198,17 +214,39 @@ impl CardPool {
     }
 
     fn deck_problems(&self, deck: &DeckList) -> Vec<String> {
+        self.decklist_problems(deck.cards.iter().copied())
+            .into_iter()
+            .map(|p| format!("deck {:?}: {p}", deck.key))
+            .collect()
+    }
+
+    /// Everything wrong with a decklist of (card key, copies) as a deck for
+    /// this pool: its size, cards the pool doesn't have, and too many copies.
+    /// Pack decks, the deck builder and players' own decks all use this.
+    pub fn decklist_problems<'a>(
+        &self,
+        cards: impl IntoIterator<Item = (&'a str, u32)>,
+    ) -> Vec<String> {
+        let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
+        for (key, n) in cards {
+            *counts.entry(key).or_default() += u64::from(n);
+        }
         let mut problems = Vec::new();
-        if deck.size() != DECK_SIZE {
+        let size: u64 = counts.values().sum();
+        if size != u64::from(DECK_SIZE) {
             problems.push(format!(
-                "deck {:?}: has {} cards, but decks must have exactly {DECK_SIZE}",
-                deck.key,
-                deck.size()
+                "has {size} cards, but decks must have exactly {DECK_SIZE}"
             ));
         }
-        for (key, _) in deck.cards {
-            if self.card(key).is_none() {
-                problems.push(format!("deck {:?}: unknown card {key:?}", deck.key));
+        for (key, n) in counts {
+            match self.card(key) {
+                None => problems.push(format!("unknown card {key:?}")),
+                Some(def) if !def.is_land() && n > u64::from(MAX_COPIES) => problems.push(format!(
+                    "{n} copies of {}, but at most {MAX_COPIES} are allowed (basic lands \
+                         are exempt)",
+                    def.name
+                )),
+                Some(_) => {}
             }
         }
         problems
@@ -275,6 +313,7 @@ fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
             })
             .collect::<Vec<_>>()
             .leak(),
+        flashback: spec.flashback.map(leak),
     };
     problems.extend(def.problems());
     if problems.is_empty() {
@@ -318,6 +357,7 @@ mod tests {
             subtype: String::new(),
             keywords: vec![Keyword::Flying],
             effects: vec![],
+            flashback: None,
             abilities: vec![AbilitySpec::Triggered {
                 when: Trigger::Enters,
                 only_if: None,
@@ -348,7 +388,7 @@ mod tests {
         let mut pool = CardPool::builtin();
         let pack = Pack {
             cards: vec![creature("test-courier")],
-            decks: vec![deck("test-deck", &[("test-courier", 36), ("lagoon", 24)])],
+            decks: vec![deck("test-deck", &[("test-courier", 4), ("lagoon", 56)])],
         };
         pool.add_pack(pack).unwrap();
         let def = pool.card("test-courier").unwrap();
@@ -371,6 +411,7 @@ mod tests {
             effects: vec![Effect::Damage {
                 amount: 1,
                 target: TargetKind::Any,
+                whose: Default::default(),
             }],
         }];
         let mut no_toughness = creature("test-wisp");
@@ -387,7 +428,7 @@ mod tests {
             ],
             decks: vec![
                 deck("tide-ash", &[("lagoon", 60)]),
-                deck("test-short", &[("test-fine", 10)]),
+                deck("test-short", &[("test-fine", 4)]),
                 deck("test-missing", &[("test-wisp", 30), ("lagoon", 30)]),
             ],
         };
@@ -401,7 +442,7 @@ mod tests {
                 "card \"test-wisp\": a creature needs both power and toughness",
                 "card \"test-gremlin\": bad mana symbol 'X' in cost \"1X\"",
                 "deck \"tide-ash\": that key is already taken",
-                "deck \"test-short\": has 10 cards, but decks must have exactly 60",
+                "deck \"test-short\": has 4 cards, but decks must have exactly 60",
                 "deck \"test-missing\": unknown card \"test-wisp\"",
             ]
         );
@@ -448,5 +489,34 @@ mod tests {
                 "card \"test-hex\": \"that_player\" only works in an ability triggered by a player",
             ]
         );
+    }
+
+    #[test]
+    fn at_most_four_copies_except_basic_lands() {
+        let pool = CardPool::builtin();
+        let ok = [("blaze", 4), ("crag", 56)];
+        assert_eq!(pool.decklist_problems(ok), Vec::<String>::new());
+        let too_many = [("blaze", 5), ("crag", 55)];
+        assert_eq!(
+            pool.decklist_problems(too_many),
+            ["5 copies of Blaze, but at most 4 are allowed (basic lands are exempt)"]
+        );
+        // Counts for the same card add up, and huge counts don't overflow.
+        let split = [("blaze", 3), ("crag", 54), ("blaze", 3)];
+        assert_eq!(pool.decklist_problems(split).len(), 1);
+        let huge = [("crag", u32::MAX), ("bog", u32::MAX)];
+        assert_eq!(
+            pool.decklist_problems(huge),
+            ["has 8589934590 cards, but decks must have exactly 60"]
+        );
+    }
+
+    #[test]
+    fn packs_survive_being_written_and_read_back() {
+        let text = include_str!("../tests/fixtures/sample-pack.toml");
+        let pack: Pack = toml::from_str(text).unwrap();
+        let written = toml::to_string(&pack).unwrap();
+        let again: Pack = toml::from_str(&written).unwrap();
+        assert_eq!(again, pack, "written as:\n{written}");
     }
 }

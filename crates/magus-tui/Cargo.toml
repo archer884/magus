@@ -19,3 +19,4 @@ magus-server.workspace = true
 rand.workspace = true
 ratatui.workspace = true
 tokio.workspace = true
+toml.workspace = true

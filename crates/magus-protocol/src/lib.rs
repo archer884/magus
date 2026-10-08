@@ -8,6 +8,8 @@
 use futures::{SinkExt, StreamExt};
 use magus_core::CardPool;
 use magus_core::{Action, GameView, PlayerId};
+use std::collections::BTreeMap;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
@@ -15,7 +17,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 7878;
 const MAX_LINE: usize = 1 << 20;
 
@@ -26,9 +28,16 @@ pub enum ClientMsg {
         name: String,
         protocol: u32,
     },
+    /// Join `room` with one of the decks the server offers, by key.
     Join {
         room: String,
         deck: String,
+    },
+    /// Join `room` with your own decklist. The server checks it against its
+    /// own card pool (size, known cards, copy limit) and refuses it otherwise.
+    JoinCustom {
+        room: String,
+        deck: CustomDeck,
     },
     /// `version` must match the latest `GameView::version`, so a stale action
     /// can never be applied to a game that has moved on.
@@ -57,6 +66,14 @@ pub enum ServerMsg {
     Error {
         message: String,
     },
+}
+
+/// A player's own deck, as sent in [`ClientMsg::JoinCustom`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomDeck {
+    pub name: String,
+    /// Card key → number of copies.
+    pub cards: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,8 +177,8 @@ mod tests {
 
         let pool = CardPool::builtin();
         let seats = [
-            ("A".to_string(), pool.decks()[0]),
-            ("B".to_string(), pool.decks()[1]),
+            ("A".to_string(), pool.decks()[0].cards),
+            ("B".to_string(), pool.decks()[1].cards),
         ];
         let view = Game::new(&pool, &seats, 1).view(0);
         let msg = ServerMsg::State {

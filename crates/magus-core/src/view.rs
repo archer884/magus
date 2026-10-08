@@ -79,6 +79,7 @@ pub struct PlayerView {
     pub hand_size: usize,
     pub library_size: usize,
     pub graveyard: Vec<CardView>,
+    pub exile: Vec<CardView>,
     pub lost: bool,
 }
 
@@ -132,6 +133,15 @@ pub enum Prompt {
     /// You're over the hand size limit; discard exactly this many cards.
     Discard {
         count: usize,
+    },
+    /// A spell or ability you control asks you to choose one of these cards
+    /// (in your hand), or none if `optional`.
+    ChooseCard {
+        /// What the choice is for, e.g. "put a creature card from your hand
+        /// onto the battlefield".
+        reason: String,
+        options: Vec<ObjectId>,
+        optional: bool,
     },
     GameOver {
         winner: Option<PlayerId>,

@@ -544,6 +544,7 @@ dependencies = [
  "rand",
  "ratatui",
  "tokio",
+ "toml",
 ]
 
 [[package]]

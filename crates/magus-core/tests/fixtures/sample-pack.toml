@@ -55,13 +55,15 @@ effects = [
     { type = "draw", who = "you", count = 1 },
 ]
 
+# Only hits the opponent's creatures, and can be cast again from the graveyard.
 [[card]]
 key = "riptide-lash"
 name = "Riptide Lash"
 type = "instant"
 cost = "1UB"
+flashback = "3UB"
 effects = [
-    { type = "damage", amount = 2, target = "creature" },
+    { type = "damage", amount = 2, target = "creature", whose = "opponent" },
     { type = "draw", who = "you", count = 1 },
 ]
 

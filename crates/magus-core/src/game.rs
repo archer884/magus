@@ -11,10 +11,10 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::card::{
-    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, Trigger, Who,
+    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, TargetSpec,
+    Trigger, Who, Whose,
 };
-use crate::cards::DeckList;
-use crate::mana::{Color, plan_payment};
+use crate::mana::{Color, ManaCost, plan_payment};
 use crate::pool::CardPool;
 use crate::view::{
     AttackOption, BlockOption, CardView, GameView, PermanentView, PlayKind, PlayOption, PlayerView,
@@ -84,6 +84,11 @@ pub enum Action {
     Discard {
         cards: Vec<ObjectId>,
     },
+    /// Answers [`Prompt::ChooseCard`]: one of its options, or `None` to choose
+    /// nothing when that's allowed.
+    ChooseCard {
+        card: Option<ObjectId>,
+    },
     Concede,
 }
 
@@ -147,6 +152,8 @@ enum Zone {
     Battlefield,
     Graveyard,
     Stack,
+    /// Removed from the game. Public, like the graveyard.
+    Exile,
 }
 
 /// One physical card, wherever it currently is.
@@ -199,6 +206,7 @@ struct Player {
     library: Vec<ObjectId>,
     hand: Vec<ObjectId>,
     graveyard: Vec<ObjectId>,
+    exile: Vec<ObjectId>,
     lost: bool,
     drew_from_empty: bool,
 }
@@ -262,7 +270,19 @@ enum Pending {
     Attackers(PlayerId),
     Blockers(PlayerId),
     Discard(PlayerId, usize),
+    /// Choosing a card partway through resolving something (see `Choosing`).
+    Choose(PlayerId),
     GameOver(Option<PlayerId>),
+}
+
+/// A spell or ability paused in the middle of resolving, waiting for its
+/// controller to choose a card. It stays on the stack until it finishes.
+#[derive(Debug, Clone)]
+struct Choosing {
+    item: StackItem,
+    /// The effect that asked, and so where to carry on after the choice.
+    effect: usize,
+    options: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +302,7 @@ pub struct Game {
     /// Abilities that have triggered but aren't on the stack yet. They go on
     /// the next time a player would get priority (see `settle`).
     triggered: Vec<Triggered>,
+    choosing: Option<Choosing>,
     next_id: u32,
     version: u64,
     rng: StdRng,
@@ -289,9 +310,10 @@ pub struct Game {
 }
 
 impl Game {
-    /// Starts a game. Each seat is a player name and a deck whose cards are in
-    /// `pool`; the first player is chosen at random and skips their first draw.
-    pub fn new(pool: &CardPool, seats: &[(String, &DeckList)], seed: u64) -> Game {
+    /// Starts a game. Each seat is a player name and a decklist of (card key,
+    /// copies) whose cards are in `pool`; the first player is chosen at random
+    /// and skips their first draw.
+    pub fn new(pool: &CardPool, seats: &[(String, &[(&str, u32)])], seed: u64) -> Game {
         assert!(seats.len() >= 2, "a game needs at least two players");
         let mut game = Game {
             players: Vec::new(),
@@ -306,6 +328,7 @@ impl Game {
             land_played: false,
             combat: Combat::default(),
             triggered: Vec::new(),
+            choosing: None,
             next_id: 1,
             version: 0,
             rng: StdRng::seed_from_u64(seed),
@@ -313,7 +336,6 @@ impl Game {
         };
         for (pid, (name, deck)) in seats.iter().enumerate() {
             let mut defs: Vec<&'static CardDef> = deck
-                .cards
                 .iter()
                 .flat_map(|&(key, n)| {
                     let def = pool
@@ -334,6 +356,7 @@ impl Game {
                 library,
                 hand: Vec::new(),
                 graveyard: Vec::new(),
+                exile: Vec::new(),
                 lost: false,
                 drew_from_empty: false,
             });
@@ -376,7 +399,8 @@ impl Game {
             Pending::Priority(p)
             | Pending::Attackers(p)
             | Pending::Blockers(p)
-            | Pending::Discard(p, _) => Some(p),
+            | Pending::Discard(p, _)
+            | Pending::Choose(p) => Some(p),
             Pending::GameOver(_) => None,
         }
     }
@@ -426,6 +450,12 @@ impl Game {
                 }
                 self.discard(p, count, cards)?;
             }
+            Action::ChooseCard { card } => {
+                if self.pending != Pending::Choose(p) {
+                    return reject("you aren't choosing a card");
+                }
+                self.choose(p, card)?;
+            }
         }
         self.version += 1;
         self.settle();
@@ -447,6 +477,7 @@ impl Game {
                     hand_size: pl.hand.len(),
                     library_size: pl.library.len(),
                     graveyard: pl.graveyard.iter().map(|&c| self.card_view(c)).collect(),
+                    exile: pl.exile.iter().map(|&c| self.card_view(c)).collect(),
                     lost: pl.lost,
                 })
                 .collect(),
@@ -496,6 +527,16 @@ impl Game {
                 options: self.block_options(p),
             },
             Pending::Discard(q, count) if q == p => Prompt::Discard { count },
+            Pending::Choose(q) if q == p => {
+                let choosing = self.choosing.as_ref().expect("a choice is pending");
+                let def = self.objects[&choosing.item.source].def;
+                let what = self.item_effects(&choosing.item)[choosing.effect].describe();
+                Prompt::ChooseCard {
+                    reason: format!("{}: {what}", def.name),
+                    options: choosing.options.clone(),
+                    optional: true,
+                }
+            }
             _ => Prompt::Waiting {
                 on: self.waiting_on().unwrap_or(self.active),
             },
@@ -602,6 +643,7 @@ impl Game {
             Zone::Library => player.library.retain(|&x| x != id),
             Zone::Hand => player.hand.retain(|&x| x != id),
             Zone::Graveyard => player.graveyard.retain(|&x| x != id),
+            Zone::Exile => player.exile.retain(|&x| x != id),
             Zone::Stack => self.stack.retain(|s| s.id != id),
             Zone::Battlefield => {
                 self.battlefield.retain(|&x| x != id);
@@ -614,6 +656,7 @@ impl Game {
             Zone::Library => player.library.push(id),
             Zone::Hand => player.hand.push(id),
             Zone::Graveyard => player.graveyard.push(id),
+            Zone::Exile => player.exile.push(id),
             Zone::Battlefield => self.battlefield.push(id),
             Zone::Stack => {}
         }
@@ -779,10 +822,15 @@ impl Game {
         self.passes += 1;
         if self.passes >= self.living().count() {
             self.passes = 0;
-            match self.stack.pop() {
+            // The item stays on the stack while it resolves, in case it
+            // stops to ask for a choice.
+            match self.stack.last().cloned() {
                 Some(item) => {
+                    let id = item.id;
                     self.resolve(item);
-                    self.give_priority(self.active);
+                    if self.choosing.is_none() {
+                        self.finish_resolving(id);
+                    }
                 }
                 None => self.advance_step(),
             }
@@ -805,7 +853,9 @@ impl Game {
                 self.start_turn(next);
                 continue;
             }
-            if self.stack_triggers() {
+            // Abilities that trigger while something is resolving wait for it
+            // to finish.
+            if self.choosing.is_none() && self.stack_triggers() {
                 continue;
             }
             match self.pending {
@@ -813,6 +863,11 @@ impl Game {
                     self.pass_priority()
                 }
                 Pending::Blockers(p) if self.players[p].lost => self.next_blocker(),
+                Pending::Choose(p) if self.players[p].lost => {
+                    // Its controller left the game, and their spell with them.
+                    let choosing = self.choosing.take().expect("a choice is pending");
+                    self.finish_resolving(choosing.item.id);
+                }
                 _ => return,
             }
         }
@@ -898,7 +953,11 @@ impl Game {
             && self.stack.is_empty();
         let lands = self.untapped_lands(p);
         let mut plays = Vec::new();
-        for &id in &self.players[p].hand {
+        let with_flashback = self.players[p]
+            .graveyard
+            .iter()
+            .filter(|id| self.objects[id].def.flashback.is_some());
+        for &id in self.players[p].hand.iter().chain(with_flashback) {
             let def = self.objects[&id].def;
             if def.is_land() {
                 if sorcery_speed && !self.land_played {
@@ -913,7 +972,7 @@ impl Game {
             if !def.is_instant() && !sorcery_speed {
                 continue;
             }
-            if plan_payment(&def.mana_cost(), &lands).is_none() {
+            if plan_payment(&self.cast_cost(id), &lands).is_none() {
                 continue;
             }
             let targets = match def.spell_target() {
@@ -935,17 +994,26 @@ impl Game {
         plays
     }
 
-    /// Everything a spell controlled by `caster` that targets `kind` could target.
-    fn valid_targets(&self, kind: TargetKind, caster: PlayerId) -> Vec<Target> {
+    /// Everything a spell controlled by `caster` that targets `spec` could target.
+    fn valid_targets(&self, spec: TargetSpec, caster: PlayerId) -> Vec<Target> {
+        // "Whose" means the player itself, the controller of a permanent or
+        // spell, or the owner of a graveyard.
+        let allowed = |p: PlayerId| match spec.whose {
+            Whose::Anyone => true,
+            Whose::You => p == caster,
+            Whose::Opponent => p != caster,
+        };
+        let kind = spec.kind;
         let mut targets = Vec::new();
         if matches!(kind, TargetKind::Any | TargetKind::Player) {
-            targets.extend(self.living().map(Target::Player));
+            targets.extend(self.living().filter(|&p| allowed(p)).map(Target::Player));
         }
         if matches!(kind, TargetKind::Any | TargetKind::Creature) {
             targets.extend(
                 self.battlefield
                     .iter()
                     .filter(|id| self.objects[id].is_creature())
+                    .filter(|id| allowed(self.objects[id].controller))
                     .map(|&id| Target::Permanent(id)),
             );
         }
@@ -953,15 +1021,15 @@ impl Game {
             targets.extend(
                 self.stack
                     .iter()
-                    .filter(|s| s.is_spell())
+                    .filter(|s| s.is_spell() && allowed(s.controller))
                     .map(|s| Target::Spell(s.id)),
             );
         }
-        if kind == TargetKind::CreatureCardInYourGraveyard {
+        if kind == TargetKind::CreatureCardInGraveyard {
             targets.extend(
-                self.players[caster]
-                    .graveyard
-                    .iter()
+                self.living()
+                    .filter(|&p| allowed(p))
+                    .flat_map(|p| &self.players[p].graveyard)
                     .filter(|id| self.objects[id].is_creature())
                     .map(|&id| Target::GraveyardCard(id)),
             );
@@ -971,8 +1039,8 @@ impl Game {
 
     /// Whether `target`, chosen when `item` was put on the stack, is still
     /// legal: still a valid target, and (for objects) not moved since.
-    fn target_still_legal(&self, item: &StackItem, kind: TargetKind, target: Target) -> bool {
-        self.valid_targets(kind, item.controller).contains(&target)
+    fn target_still_legal(&self, item: &StackItem, spec: TargetSpec, target: Target) -> bool {
+        self.valid_targets(spec, item.controller).contains(&target)
             && target.object().map(|id| self.objects[&id].moves) == item.target_moves
     }
 
@@ -982,6 +1050,27 @@ impl Game {
             Target::Permanent(id) | Target::Spell(id) | Target::GraveyardCard(id) => {
                 self.card_name(id).to_string()
             }
+        }
+    }
+
+    /// What it costs to cast `card` from where it is now: its flashback cost
+    /// from the graveyard, its mana cost otherwise.
+    fn cast_cost(&self, card: ObjectId) -> ManaCost {
+        let o = &self.objects[&card];
+        match (o.zone, o.def.flashback) {
+            (Zone::Graveyard, Some(cost)) => ManaCost::parse(cost),
+            _ => o.def.mana_cost(),
+        }
+    }
+
+    /// Moves a spell that's leaving the stack (resolved, fizzled or countered)
+    /// to its owner's graveyard, or to exile if it was cast with flashback.
+    fn spell_done(&mut self, id: ObjectId) {
+        if self.objects[&id].cast_from == Some(CastZone::Graveyard) {
+            self.log(format!("{} is exiled.", self.card_name(id)));
+            self.move_to(id, Zone::Exile);
+        } else {
+            self.move_to(id, Zone::Graveyard);
         }
     }
 
@@ -1022,13 +1111,17 @@ impl Game {
             (Some(_), Some(_)) => return reject("that isn't a legal target"),
         }
         let def = self.objects[&card].def;
-        let lands = plan_payment(&def.mana_cost(), &self.untapped_lands(p))
+        let from = match self.objects[&card].zone {
+            Zone::Graveyard => CastZone::Graveyard,
+            _ => CastZone::Hand,
+        };
+        let lands = plan_payment(&self.cast_cost(card), &self.untapped_lands(p))
             .expect("affordability was checked");
         for land in lands {
             self.objects.get_mut(&land).expect("land exists").tapped = true;
         }
         self.move_to(card, Zone::Stack);
-        self.objects.get_mut(&card).expect("card exists").cast_from = Some(CastZone::Hand);
+        self.objects.get_mut(&card).expect("card exists").cast_from = Some(from);
         self.stack.push(StackItem {
             id: card,
             source: card,
@@ -1056,7 +1149,7 @@ impl Game {
         {
             self.log(format!("{} fizzles: its target is gone.", def.name));
             if item.is_spell() {
-                self.move_to(item.id, Zone::Graveyard);
+                self.spell_done(item.id);
             }
             return;
         }
@@ -1070,12 +1163,10 @@ impl Game {
             self.fire(Event::Entered(item.id));
             return;
         }
-        let effects = match item.kind {
-            StackKind::Spell => def.effects,
+        match item.kind {
+            StackKind::Spell => {}
             StackKind::Ability(i) => {
-                let Ability::Triggered {
-                    only_if, effects, ..
-                } = def.abilities[i];
+                let Ability::Triggered { only_if, .. } = def.abilities[i];
                 // Checked again on resolution. If the source has left the
                 // battlefield, go by how it was when it triggered, as the
                 // real rules do ("last known information").
@@ -1090,15 +1181,92 @@ impl Game {
                     return;
                 }
                 self.log(format!("{}'s ability resolves.", def.name));
+            }
+        }
+        self.apply_effects(item, 0);
+    }
+
+    /// What `item` does when it resolves.
+    fn item_effects(&self, item: &StackItem) -> &'static [Effect] {
+        let def = self.objects[&item.source].def;
+        match item.kind {
+            StackKind::Spell => def.effects,
+            StackKind::Ability(i) => {
+                let Ability::Triggered { effects, .. } = def.abilities[i];
                 effects
             }
-        };
-        for effect in effects {
+        }
+    }
+
+    /// Applies `item`'s effects from the `from`th on. If one needs a choice,
+    /// stops and records where it got to in `self.choosing`; `choose` carries
+    /// on from there.
+    fn apply_effects(&mut self, item: StackItem, from: usize) {
+        let effects = self.item_effects(&item);
+        for (i, effect) in effects.iter().enumerate().skip(from) {
+            if *effect == Effect::PutFromHand {
+                let options: Vec<ObjectId> = self.players[item.controller]
+                    .hand
+                    .iter()
+                    .copied()
+                    .filter(|id| self.objects[id].is_creature())
+                    .collect();
+                if !options.is_empty() {
+                    self.pending = Pending::Choose(item.controller);
+                    self.choosing = Some(Choosing {
+                        item,
+                        effect: i,
+                        options,
+                    });
+                    return;
+                }
+                let name = self.name(item.controller).to_string();
+                self.log(format!(
+                    "{name} has no creature card to put onto the battlefield."
+                ));
+                continue;
+            }
             self.apply_effect(*effect, &item);
         }
         if item.is_spell() {
-            self.move_to(item.id, Zone::Graveyard);
+            self.spell_done(item.id);
         }
+    }
+
+    /// Takes a finished item off the stack and gives the active player priority.
+    fn finish_resolving(&mut self, id: ObjectId) {
+        self.stack.retain(|s| s.id != id);
+        self.passes = 0;
+        self.give_priority(self.active);
+    }
+
+    fn choose(&mut self, p: PlayerId, card: Option<ObjectId>) -> Result<(), ActionError> {
+        let choosing = self.choosing.as_ref().expect("a choice is pending");
+        if let Some(card) = card
+            && !choosing.options.contains(&card)
+        {
+            return reject("you can't choose that card");
+        }
+        let Choosing { item, effect, .. } = self.choosing.take().expect("a choice is pending");
+        match card {
+            Some(card) => {
+                self.move_to(card, Zone::Battlefield);
+                self.objects.get_mut(&card).expect("card exists").controller = p;
+                self.log(format!(
+                    "{} puts {} onto the battlefield.",
+                    self.name(p),
+                    self.card_name(card)
+                ));
+                self.fire(Event::Entered(card));
+            }
+            None => self.log(format!("{} chooses nothing.", self.name(p))),
+        }
+        let id = item.id;
+        self.apply_effects(item, effect + 1);
+        if self.choosing.is_none() {
+            self.finish_resolving(id);
+        }
+        Ok(())
     }
 
     /// Notes every ability that triggers on `event`. They wait in
@@ -1184,13 +1352,13 @@ impl Game {
                     self.deal_damage(source, t, amount, false);
                 }
             }
-            Effect::Destroy => {
+            Effect::Destroy { .. } => {
                 if let Some(Target::Permanent(id)) = target {
                     self.log(format!("{} is destroyed.", self.card_name(id)));
                     self.move_to(id, Zone::Graveyard);
                 }
             }
-            Effect::ReturnToBattlefield => {
+            Effect::ReturnToBattlefield { .. } => {
                 if let Some(Target::GraveyardCard(id)) = target {
                     self.move_to(id, Zone::Battlefield);
                     self.objects.get_mut(&id).expect("object exists").controller = controller;
@@ -1202,7 +1370,7 @@ impl Game {
                     self.fire(Event::Entered(id));
                 }
             }
-            Effect::ReturnToHand => {
+            Effect::ReturnToHand { .. } => {
                 if let Some(Target::GraveyardCard(id)) = target {
                     let owner = self.objects[&id].owner;
                     self.log(format!(
@@ -1213,7 +1381,7 @@ impl Game {
                     self.move_to(id, Zone::Hand);
                 }
             }
-            Effect::Blink => {
+            Effect::Blink { .. } => {
                 if let Some(Target::Permanent(id)) = target {
                     self.move_to(id, Zone::Battlefield);
                     let o = self.objects.get_mut(&id).expect("object exists");
@@ -1223,7 +1391,8 @@ impl Game {
                     self.fire(Event::Entered(id));
                 }
             }
-            Effect::Bounce => {
+            Effect::PutFromHand => unreachable!("handled by apply_effects"),
+            Effect::Bounce { .. } => {
                 if let Some(Target::Permanent(id)) = target {
                     let owner = self.objects[&id].owner;
                     self.log(format!(
@@ -1234,7 +1403,9 @@ impl Game {
                     self.move_to(id, Zone::Hand);
                 }
             }
-            Effect::Pump { power, toughness } => {
+            Effect::Pump {
+                power, toughness, ..
+            } => {
                 if let Some(Target::Permanent(id)) = target {
                     let o = self.objects.get_mut(&id).expect("object exists");
                     o.power_mod += power;
@@ -1245,10 +1416,10 @@ impl Game {
                     ));
                 }
             }
-            Effect::Counter => {
+            Effect::Counter { .. } => {
                 if let Some(Target::Spell(id)) = target {
                     self.log(format!("{} is countered.", self.card_name(id)));
-                    self.move_to(id, Zone::Graveyard);
+                    self.spell_done(id);
                 }
             }
             Effect::Draw { who, count } => {
@@ -1569,8 +1740,8 @@ mod tests {
     /// A game with empty hands and battlefields on player 0's first main phase.
     fn blank_game() -> Game {
         let seats = [
-            ("Ann".to_string(), &DECKS[0]),
-            ("Bob".to_string(), &DECKS[1]),
+            ("Ann".to_string(), DECKS[0].cards),
+            ("Bob".to_string(), DECKS[1].cards),
         ];
         let mut game = Game::new(&CardPool::builtin(), &seats, 7);
         for p in 0..2 {
@@ -1813,6 +1984,7 @@ mod tests {
             subtype: "",
             keywords: &[],
             effects: &[],
+            flashback: None,
             abilities: &[
                 Ability::Triggered {
                     when: Trigger::Enters,
@@ -2038,6 +2210,23 @@ mod tests {
     }
 
     #[test]
+    fn targets_can_be_limited_to_whose_they_are() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "meadow", 2);
+        let mine = put(&mut g, 0, "grovekin", Zone::Battlefield);
+        put(&mut g, 1, "grovekin", Zone::Battlefield);
+        let veilstep = put(&mut g, 0, "veilstep", Zone::Hand);
+        let plays = g.legal_plays(0);
+        let play = plays.iter().find(|o| o.card == veilstep).unwrap();
+        assert_eq!(play.targets, Some(vec![Target::Permanent(mine)]));
+        assert_eq!(
+            g.objects[&veilstep].def.rules_text(),
+            "Exile target creature you control, then return it to the battlefield under its \
+             owner's control."
+        );
+    }
+
+    #[test]
     fn return_to_hand_from_graveyard() {
         let mut g = blank_game();
         lands(&mut g, 0, "thicket", 2);
@@ -2134,6 +2323,171 @@ mod tests {
         pass_until(&mut g, |g| g.is_over());
         // Player 1 draws first, from an empty library.
         assert_eq!(g.result(), Some(Some(0)));
+    }
+
+    #[test]
+    fn flashback_casts_from_the_graveyard_then_exiles() {
+        let mut g = blank_game();
+        let spark = in_graveyard(&mut g, 0, cards::card("sparkfall").unwrap());
+        lands(&mut g, 0, "crag", 2);
+        assert!(
+            g.legal_plays(0).iter().all(|o| o.card != spark),
+            "two lands pay {{1}}{{R}} but not the flashback cost {{2}}{{R}}"
+        );
+        lands(&mut g, 0, "crag", 1);
+        g.apply(
+            0,
+            Action::Cast {
+                card: spark,
+                target: Some(Target::Player(1)),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.players[1].life, STARTING_LIFE - 2);
+        assert_eq!(g.objects[&spark].zone, Zone::Exile);
+        let names: Vec<_> = g.view(1).players[0]
+            .exile
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, ["Sparkfall"], "exile is public");
+    }
+
+    #[test]
+    fn a_countered_spell_cast_from_hand_goes_to_the_graveyard() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "crag", 2);
+        lands(&mut g, 1, "lagoon", 2);
+        put(&mut g, 1, "dissolve-thought", Zone::Hand);
+        let spark = cast_at(&mut g, 0, "sparkfall", Target::Player(1));
+        let counter = *g.players[1].hand.last().unwrap();
+        g.apply(
+            1,
+            Action::Cast {
+                card: counter,
+                target: Some(Target::Spell(spark)),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&spark].zone, Zone::Graveyard);
+    }
+
+    #[test]
+    fn countering_a_spell_cast_with_flashback_exiles_it() {
+        let mut g = blank_game();
+        let spark = in_graveyard(&mut g, 0, cards::card("sparkfall").unwrap());
+        lands(&mut g, 0, "crag", 3);
+        lands(&mut g, 1, "lagoon", 2);
+        put(&mut g, 1, "dissolve-thought", Zone::Hand);
+        g.apply(
+            0,
+            Action::Cast {
+                card: spark,
+                target: Some(Target::Player(1)),
+            },
+        )
+        .unwrap();
+        let counter = *g.players[1].hand.last().unwrap();
+        g.apply(
+            1,
+            Action::Cast {
+                card: counter,
+                target: Some(Target::Spell(spark)),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.players[1].life, STARTING_LIFE);
+        assert_eq!(g.objects[&spark].zone, Zone::Exile);
+    }
+
+    #[test]
+    fn beckon_puts_a_chosen_creature_onto_the_battlefield() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "thicket", 3);
+        let wraith = put(&mut g, 0, "gravecall-wraith", Zone::Hand);
+        put(&mut g, 0, "blaze", Zone::Hand);
+        let beckon = put(&mut g, 0, "beckon-the-wild", Zone::Hand);
+        g.apply(
+            0,
+            Action::Cast {
+                card: beckon,
+                target: None,
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.pending == Pending::Choose(0));
+        let Prompt::ChooseCard {
+            options, optional, ..
+        } = g.view(0).prompt
+        else {
+            panic!("expected a choice");
+        };
+        assert_eq!(options, [wraith], "only creature cards are offered");
+        assert!(optional);
+        assert_eq!(
+            g.stack.len(),
+            1,
+            "Beckon stays on the stack while Ann chooses"
+        );
+        // Bob only learns that Ann is choosing, not what she could choose.
+        let bob = g.view(1);
+        assert_eq!(bob.prompt, Prompt::Waiting { on: 0 });
+        assert!(!format!("{bob:?}").contains("Gravecall"));
+        assert_eq!(
+            g.apply(0, Action::ChooseCard { card: Some(beckon) }),
+            Err(ActionError("you can't choose that card".into()))
+        );
+
+        let hand = g.players[0].hand.len();
+        g.apply(0, Action::ChooseCard { card: Some(wraith) })
+            .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(g.on_battlefield(wraith));
+        assert_eq!(g.objects[&beckon].zone, Zone::Graveyard);
+        assert_eq!(
+            g.players[0].hand.len(),
+            hand - 1 + 2,
+            "the wraith wasn't cast, so it draws 2"
+        );
+    }
+
+    #[test]
+    fn beckon_can_choose_nothing_or_find_nothing() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "thicket", 6);
+        let boar = put(&mut g, 0, "thornback-boar", Zone::Hand);
+        cast_from_hand(&mut g, 0, cards::card("beckon-the-wild").unwrap());
+        pass_until(&mut g, |g| g.pending == Pending::Choose(0));
+        g.apply(0, Action::ChooseCard { card: None }).unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&boar].zone, Zone::Hand);
+
+        // With no creature card in hand there's nothing to ask.
+        g.move_to(boar, Zone::Graveyard);
+        cast_from_hand(&mut g, 0, cards::card("beckon-the-wild").unwrap());
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Ann has no creature card to put onto the battlefield.")
+        );
+    }
+
+    #[test]
+    fn blightmaw_beckoned_loses_you_the_game() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "thicket", 3);
+        let tyrant = g.create(blightmaw_card("blightmaw-tyrant"), 0, Zone::Hand);
+        g.players[0].hand.push(tyrant);
+        cast_from_hand(&mut g, 0, cards::card("beckon-the-wild").unwrap());
+        pass_until(&mut g, |g| g.pending == Pending::Choose(0));
+        g.apply(0, Action::ChooseCard { card: Some(tyrant) })
+            .unwrap();
+        pass_until(&mut g, |g| g.is_over());
+        assert_eq!(g.result(), Some(Some(1)));
     }
 
     #[test]

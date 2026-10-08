@@ -36,6 +36,36 @@ start anything else. The bot plays a random deck. Pick it with `--bot-deck
 tide-ash`, and speed it up or slow it down with `--bot-delay-ms` (default 600).
 `--deck` still picks your own deck.
 
+### Building your own deck
+
+```sh
+./target/release/magus deck-builder --deck my-deck.toml
+./target/release/magus deck-builder --deck my-deck.toml --cards my-pack.toml  # pack cards too
+```
+
+The deck builder lists every card on the left and your deck in the middle,
+with the selected card, a mana curve, the color split and any problems on the
+right. It works offline. Enter (or `+`) adds a copy, `-` removes one, `c` and
+`t` filter the cards by color and type, `r` renames the deck, `s` saves and
+`q` quits. If the file already exists, it's opened for editing.
+
+A deck is exactly 60 cards, with at most 4 copies of any card except basic
+lands. The builder won't let you add a fifth copy, and lists anything else
+that's wrong. You can save an unfinished deck and come back to it.
+
+Play it by giving its path to `--deck`, which takes either a deck file or the
+name of a deck the server offers:
+
+```sh
+./target/release/magus --deck my-deck.toml --room friday
+./target/release/magus --solo --deck my-deck.toml
+```
+
+The server checks your deck against its own cards, so a deck of built-in cards
+works anywhere, while pack cards only work on servers that loaded that pack.
+A deck file is also a card pack with one deck in it, so a server can offer
+your deck to everyone with `--cards my-deck.toml`.
+
 You can also run the pieces separately, for example to watch the server log
 or to point a bot at a remote server:
 
@@ -99,13 +129,33 @@ gullwing-courier = 4
 # ...
 ```
 
-Effects: `damage` (`amount`, `target`: `any`, `creature` or `player`),
-`destroy`, `bounce`, `pump` (`power`, `toughness`), `counter`, `blink` (exile
-a creature and return it at once, as a new object), `return_to_battlefield` /
-`return_to_hand` (target a creature card in your graveyard), `draw` (`who`,
-`count`), `gain_life` / `lose_life` / `damage_players` (`who`, `amount`),
-`lose_game` (`who`). `who` is `you`, `each_opponent`, or `that_player`. A spell
-has at most one effect that targets, and abilities can't target yet. Lands take `mana = "R"` (one symbol) and nothing else.
+Effects that **target** something:
+
+| Effect | Fields | Targets |
+|---|---|---|
+| `damage` | `amount`, `target` (`any`, `creature` or `player`) | |
+| `destroy`, `bounce`, `blink` | | a creature |
+| `pump` | `power`, `toughness` | a creature |
+| `counter` | | a spell |
+| `return_to_battlefield`, `return_to_hand` | | a creature card in a graveyard |
+
+Each of these also takes `whose`: `anyone` (the default), `you` or
+`opponent`, meaning who controls the creature or spell, whose graveyard the
+card is in, or which player. `return_to_*` default to `you`. For example
+`{ type = "destroy", whose = "opponent" }` is "destroy target creature an
+opponent controls". `blink` exiles a creature and returns it at once, as a
+new object. A spell has at most one effect that targets, and abilities can't
+target yet.
+
+Effects that don't target: `draw` (`who`, `count`), `gain_life` /
+`lose_life` / `damage_players` (`who`, `amount`), `lose_game` (`who`), and
+`put_from_hand` ("you may put a creature card from your hand onto the
+battlefield"; the player picks one while the spell resolves). `who` is `you`,
+`each_opponent`, or `that_player`.
+
+An instant or sorcery can have `flashback = "2R"`: it may also be cast from your
+graveyard for that cost, and is then exiled instead of returning to the
+graveyard. Lands take `mana = "R"` (one symbol) and nothing else.
 
 Abilities trigger (`when`) on `enters` or `deals_combat_damage_to_player`. With
 the second one, `that_player` means the player who was hit:
@@ -137,6 +187,8 @@ creature missing its toughness, a deck that isn't 60 cards, and so on.
 | ← → | Choose which attacker a creature blocks |
 | a | Attack with everything (or nothing) |
 | Tab | Switch between hand, battlefield and stack to inspect cards |
+| g | Browse every graveyard; cast a card marked ● (flashback) from yours |
+| Esc | Cancel targeting, close a popup, or choose nothing when that's allowed |
 | f | Full control: get asked at every step instead of auto-passing routine ones |
 | q | Quit (twice in a game, because leaving concedes) |
 
@@ -168,9 +220,10 @@ ignores an action that was meant for an older game state.
 One JSON object per line over TCP:
 
 ```
-→ {"type":"hello","name":"ann","protocol":1}
+→ {"type":"hello","name":"ann","protocol":3}
 ← {"type":"welcome","decks":[…]}
 → {"type":"join","room":"friday","deck":"ember-thorn"}
+  (or your own deck: {"type":"join_custom","room":"friday","deck":{"name":"Burn","cards":{"blaze":4,"crag":56}}})
 ← {"type":"waiting","room":"friday"}
 ← {"type":"started","seat":0,"players":["ann","bob"]}
 ← {"type":"state","view":{…,"prompt":{"type":"priority","plays":[…]}}}
@@ -181,7 +234,7 @@ See `crates/magus-protocol/src/lib.rs` and `crates/magus-core/src/view.rs`.
 
 ## Rules implemented
 
-- 20 life, 7-card hands, 60-card decks; the player who goes first skips their first draw
+- 20 life, 7-card hands, 60-card decks with at most 4 copies of any card but basic lands; the player who goes first skips their first draw
 - Turn steps: untap, upkeep, draw, main, declare attackers, declare blockers, combat damage, main, end, cleanup (discard down to 7)
 - One land per turn; mana is paid automatically from untapped lands
 - Full priority and stack: instants at any time, responses to spells, counterspells, and spells that fizzle when their target is gone
@@ -189,6 +242,8 @@ See `crates/magus-protocol/src/lib.rs` and `crates/magus-core/src/view.rs`.
 - Keywords: flying, reach, haste, vigilance, lifelink, deathtouch, defender
 - Triggered abilities: "when this enters" and "whenever this deals combat damage to a player", optionally with an "if" about how the card was cast
 - Returning creature cards from the graveyard to the battlefield or hand, and blinking (a blinked creature is a new object, so spells aimed at it fizzle)
+- Putting a creature from your hand onto the battlefield without casting it, and casting spells from your graveyard (flashback), after which they're exiled
+- Targets limited by whose they are ("creature you control", "spell an opponent controls")
 - "Until end of turn" boosts
 - Extra cards and decks from card packs
 - You lose at 0 life, by drawing from an empty library, or when a card says so; conceding or disconnecting forfeits

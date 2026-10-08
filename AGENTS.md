@@ -11,8 +11,12 @@ Rust (edition 2024), a Cargo workspace under `crates/`. The project owner is
 new to TCGs: explain game-rules decisions in plain terms, and don't assume
 MTG jargon is understood.
 
-**Cards are original. Never add real Magic card names, rules text or art.**
-Mechanics (flying, the stack, etc.) are fine.
+**Cards are original: don't copy real Magic cards** (their names, rules text
+or art) into the card pool. Everything else should use the real game's
+standard terms: keywords, mechanics (flying, flashback…), zones, steps and
+rules concepts. Players will read online guides, and invented synonyms make
+those confusing. Be pragmatic about this rule: it's about not copying cards,
+not about avoiding every word Magic uses.
 
 ## Layout
 
@@ -21,7 +25,7 @@ Mechanics (flying, the stack, etc.) are fine.
 | `magus-core` | Rules engine. **No I/O, no async, no networking.** Deterministic given a seed. |
 | `magus-protocol` | `ClientMsg`/`ServerMsg`, JSON-lines framing, `connect()` helper. |
 | `magus-server` | Lobby (rooms → pair two players), one tokio task per game owning the `Game`. Lib + bin. |
-| `magus-tui` | The `magus` binary: ratatui 0.29 / crossterm 0.28. `app.rs` = state + input, `ui.rs` = drawing only. |
+| `magus-tui` | The `magus` binary: ratatui 0.29 / crossterm 0.28. `app.rs` = game state + input, `ui.rs` = drawing only (its card helpers are shared). `builder.rs` = `magus deck-builder` (state, then read-only drawing), `deckfile.rs` = deck files. |
 | `magus-bot` | AI client. Lib (`run`, `choose`) + bin. Also hosts the end-to-end test. |
 
 Key files in core:
@@ -34,8 +38,11 @@ Key files in core:
   rules-text generation.
 - `mana.rs`: costs, plus `plan_payment` (auto-tap).
 - `pool.rs`: `CardPool` (built-in cards plus card packs) and the `Pack` data
-  types packs are parsed into. `Game::new` takes a pool. Parsing TOML lives in
-  `magus-server` (`load_pack`/`load_pool`), not in core.
+  types packs are read from and written to. `Game::new` takes a pool and each
+  player's decklist entries (card key, copies). `CardPool::decklist_problems`
+  is the one deck check (60 cards, known cards, at most 4 copies but basic
+  lands), used for pack decks, the deck builder and `ClientMsg::JoinCustom`.
+  Parsing TOML lives in `magus-server` (`load_pack`/`load_pool`), not in core.
 
 ## Core design rules (don't break these)
 
@@ -88,8 +95,20 @@ Key files in core:
   battlefield (blink), must go through `move_to`, which bumps the count,
   resets per-battlefield state and removes the object from combat. `draw`
   bumps it too.
-- `valid_targets(kind, caster)` takes the caster, because some kinds (e.g.
-  `CreatureCardInYourGraveyard`) depend on whose spell it is.
+- `valid_targets(spec, caster)` takes the caster, because `TargetSpec::whose`
+  (`anyone`/`you`/`opponent`) is relative to whoever controls the spell.
+- Resolution can pause for a choice. The top stack item stays on the stack
+  while it resolves; `apply_effects(item, from)` stops at an effect that needs
+  a decision (`put_from_hand`), stores `Choosing { item, effect, options }`
+  and sets `Pending::Choose`. `Action::ChooseCard` resumes from the next
+  effect, then `finish_resolving` removes the item and gives priority.
+  Triggers wait (`stack_triggers` is skipped while choosing). New mid-
+  resolution choices should reuse this.
+- Casting from the graveyard: `legal_plays` also offers graveyard cards with
+  `flashback`, `cast_cost` picks the cost by zone, and `spell_done` sends a
+  spell cast from the graveyard to exile instead (also when it fizzles or is
+  countered). Exile is public and appears in `PlayerView`.
+- Card conservation in `fuzz.rs` counts every zone; add new zones there.
 - Stack items: spells use the card's id; triggered abilities get a fresh id
   that is *not* in `objects`. Use `item.source` for the card, and
   `StackKind::Ability(i)` for which of its `abilities` is resolving.
@@ -133,6 +152,8 @@ cargo run -p magus-server -- --bind 127.0.0.1:7878 [--cards pack.toml]
 cargo run -p magus-bot -- --room practice --delay-ms 0
 cargo run -p magus-tui -- --room practice    # needs a real terminal
 cargo run -p magus-tui -- --solo             # one-command game vs. the bot
+cargo run -p magus-tui -- deck-builder --deck my-deck.toml
+cargo run -p magus-tui -- --solo --deck my-deck.toml
 ```
 
 Testing layers:
