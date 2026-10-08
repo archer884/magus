@@ -1,0 +1,12 @@
+[package]
+name = "magus-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+futures.workspace = true
+magus-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

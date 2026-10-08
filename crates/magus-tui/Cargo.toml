@@ -1,0 +1,21 @@
+[package]
+name = "magus-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "magus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+magus-bot.workspace = true
+magus-core.workspace = true
+magus-protocol.workspace = true
+magus-server.workspace = true
+rand.workspace = true
+ratatui.workspace = true
+tokio.workspace = true

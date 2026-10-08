@@ -1,0 +1,8 @@
+[package]
+name = "magus-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rand.workspace = true
+serde.workspace = true
