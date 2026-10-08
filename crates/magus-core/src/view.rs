@@ -173,6 +173,13 @@ impl GameView {
         self.hand.iter().find(|c| c.id == id)
     }
 
+    /// A card in anyone's graveyard, and whose graveyard it's in.
+    pub fn graveyard_card(&self, id: ObjectId) -> Option<(PlayerId, &CardView)> {
+        self.players
+            .iter()
+            .find_map(|p| Some((p.id, p.graveyard.iter().find(|c| c.id == id)?)))
+    }
+
     pub fn opponents(&self) -> impl Iterator<Item = &PlayerView> {
         self.players.iter().filter(move |p| p.id != self.you)
     }
@@ -188,6 +195,12 @@ impl GameView {
             Target::Spell(id) => match self.stack_item(id) {
                 Some(item) => format!("{} ({})", item.card.name, self.player_name(item.controller)),
                 None => "a spell".into(),
+            },
+            Target::GraveyardCard(id) => match self.graveyard_card(id) {
+                Some((owner, card)) => {
+                    format!("{} (in {}'s graveyard)", card.name, self.player_name(owner))
+                }
+                None => "a card in a graveyard".into(),
             },
         }
     }

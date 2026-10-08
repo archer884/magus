@@ -4,7 +4,9 @@ use crate::card::CardKind::{Instant, Sorcery};
 use crate::card::Effect::*;
 use crate::card::Keyword::*;
 use crate::card::Who::{EachOpponent, You};
-use crate::card::{Ability, CardDef, CardKind, Effect, Keyword, TargetKind, Trigger};
+use crate::card::{
+    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, Trigger,
+};
 use crate::mana::Color;
 
 const fn land(key: &'static str, name: &'static str, color: Color) -> CardDef {
@@ -66,6 +68,7 @@ const fn spell(
 const fn enters(effects: &'static [Effect]) -> Ability {
     Ability::Triggered {
         when: Trigger::Enters,
+        only_if: None,
         effects,
     }
 }
@@ -153,6 +156,9 @@ pub static CARDS: &[CardDef] = &[
         }],
     ),
     spell("judgment-ray", "Judgment Ray", "3W", Sorcery, &[Destroy]),
+    // Saves a creature from removal (the spell loses track of it) or reuses
+    // its "enters" ability.
+    spell("veilstep", "Veilstep", "1W", Instant, &[Blink]),
     // Blue: fliers, card draw, tricks
     creature(
         "skyward-kestrel",
@@ -264,6 +270,30 @@ pub static CARDS: &[CardDef] = &[
         &[],
     ),
     spell("grasp-of-ruin", "Grasp of Ruin", "1BB", Instant, &[Destroy]),
+    spell(
+        "call-from-the-mire",
+        "Call from the Mire",
+        "3B",
+        Sorcery,
+        &[ReturnToBattlefield],
+    ),
+    // Weak to cast, strong to bring back with Call from the Mire.
+    creature(
+        "gravecall-wraith",
+        "Gravecall Wraith",
+        "3B",
+        "Spirit",
+        3,
+        2,
+        &[],
+        &[Ability::Triggered {
+            when: Trigger::Enters,
+            only_if: Some(Condition::NotCastFrom {
+                zone: CastZone::Hand,
+            }),
+            effects: &[Draw { who: You, count: 2 }],
+        }],
+    ),
     spell(
         "siphon-essence",
         "Siphon Essence",
@@ -443,6 +473,13 @@ pub static CARDS: &[CardDef] = &[
             Draw { who: You, count: 1 },
         ],
     ),
+    spell(
+        "mossgrave-recovery",
+        "Mossgrave Recovery",
+        "1G",
+        Sorcery,
+        &[ReturnToHand],
+    ),
 ];
 
 pub fn card(key: &str) -> Option<&'static CardDef> {
@@ -473,7 +510,8 @@ pub static DECKS: &[DeckList] = &[
             ("thicket", 12),
             ("emberkin-scout", 4),
             ("cinderhound", 4),
-            ("grovekin", 4),
+            ("grovekin", 2),
+            ("mossgrave-recovery", 2),
             ("forgeheart-brute", 4),
             ("thornback-boar", 4),
             ("canopy-spider", 4),
@@ -489,7 +527,6 @@ pub static DECKS: &[DeckList] = &[
         cards: &[
             ("lagoon", 12),
             ("bog", 12),
-            ("skyward-kestrel", 4),
             ("fen-stalker", 4),
             ("night-leech", 4),
             ("cove-scholar", 4),
@@ -498,6 +535,8 @@ pub static DECKS: &[DeckList] = &[
             ("dissolve-thought", 4),
             ("undertow", 4),
             ("grasp-of-ruin", 4),
+            ("gravecall-wraith", 2),
+            ("call-from-the-mire", 2),
         ],
     },
     DeckList {
@@ -514,7 +553,8 @@ pub static DECKS: &[DeckList] = &[
             ("thornback-boar", 4),
             ("bastion-warden", 4),
             ("sunlit-seraph", 4),
-            ("rally-cry", 4),
+            ("rally-cry", 2),
+            ("veilstep", 2),
             ("judgment-ray", 4),
         ],
     },

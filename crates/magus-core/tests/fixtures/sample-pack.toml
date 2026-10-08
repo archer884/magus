@@ -36,6 +36,25 @@ type = "triggered"
 when = "enters"
 effects = [{ type = "gain_life", who = "you", amount = 2 }]
 
+# Triggers on combat damage, and refers back to the player it hit.
+[[card]]
+key = "saltmarsh-cutpurse"
+name = "Saltmarsh Cutpurse"
+type = "creature"
+cost = "1UB"
+subtype = "Rogue"
+power = 2
+toughness = 1
+keywords = ["flying"]
+
+[[card.ability]]
+type = "triggered"
+when = "deals_combat_damage_to_player"
+effects = [
+    { type = "lose_life", who = "that_player", amount = 1 },
+    { type = "draw", who = "you", count = 1 },
+]
+
 [[card]]
 key = "riptide-lash"
 name = "Riptide Lash"
@@ -55,7 +74,7 @@ description = "Blue/black fliers and drain, from the sample pack."
 gullwing-courier = 4
 harbor-toll = 4
 riptide-lash = 4
-skyward-kestrel = 4
+saltmarsh-cutpurse = 4
 mistwing-drake = 4
 fen-stalker = 4
 wailing-shade = 4

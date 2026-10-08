@@ -15,7 +15,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 7878;
 const MAX_LINE: usize = 1 << 20;
 

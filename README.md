@@ -99,12 +99,29 @@ gullwing-courier = 4
 # ...
 ```
 
-Effects: `damage` (`amount`, `target`: `any`, `creature`, `player` or
-`spell`), `destroy`, `bounce`, `pump` (`power`, `toughness`), `counter`,
-`draw` (`who`, `count`), `gain_life` / `lose_life` / `damage_players` (`who`,
-`amount`). `who` is `you` or `each_opponent`. A spell has at most one effect
-that targets, and abilities can't target yet. Lands take `mana = "R"` (one
-symbol) and nothing else.
+Effects: `damage` (`amount`, `target`: `any`, `creature` or `player`),
+`destroy`, `bounce`, `pump` (`power`, `toughness`), `counter`, `blink` (exile
+a creature and return it at once, as a new object), `return_to_battlefield` /
+`return_to_hand` (target a creature card in your graveyard), `draw` (`who`,
+`count`), `gain_life` / `lose_life` / `damage_players` (`who`, `amount`),
+`lose_game` (`who`). `who` is `you`, `each_opponent`, or `that_player`. A spell
+has at most one effect that targets, and abilities can't target yet. Lands take `mana = "R"` (one symbol) and nothing else.
+
+Abilities trigger (`when`) on `enters` or `deals_combat_damage_to_player`. With
+the second one, `that_player` means the player who was hit:
+
+```toml
+[[card.ability]]
+type = "triggered"
+when = "deals_combat_damage_to_player"
+effects = [{ type = "lose_life", who = "that_player", amount = 1 }]
+```
+
+An ability can also have an "if" (`only_if`), checked when it triggers and
+again when it resolves: `{ type = "cast_from", zone = "hand" }` or
+`{ type = "not_cast_from", zone = "hand" }`. "Not cast from" is also true when
+the card wasn't cast at all, e.g. when an effect returns it from the
+graveyard. `crates/magus-core/tests/fixtures/blightmaw.toml` uses both.
 
 The server checks a pack when it starts and refuses to run if anything is
 wrong, listing every problem: a typo'd field, a key that's already taken, a
@@ -170,9 +187,11 @@ See `crates/magus-protocol/src/lib.rs` and `crates/magus-core/src/view.rs`.
 - Full priority and stack: instants at any time, responses to spells, counterspells, and spells that fizzle when their target is gone
 - Combat: multiple blockers per attacker, damage assigned in block order
 - Keywords: flying, reach, haste, vigilance, lifelink, deathtouch, defender
-- Enters-the-battlefield abilities (several per card), "until end of turn" boosts
+- Triggered abilities: "when this enters" and "whenever this deals combat damage to a player", optionally with an "if" about how the card was cast
+- Returning creature cards from the graveyard to the battlefield or hand, and blinking (a blinked creature is a new object, so spells aimed at it fizzle)
+- "Until end of turn" boosts
 - Extra cards and decks from card packs
-- You lose at 0 life or by drawing from an empty library; conceding or disconnecting forfeits
+- You lose at 0 life, by drawing from an empty library, or when a card says so; conceding or disconnecting forfeits
 
 To keep play fast, the engine passes priority for you whenever you have
 nothing you could do. The client also skips routine steps unless you turn on

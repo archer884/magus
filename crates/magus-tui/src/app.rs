@@ -203,10 +203,7 @@ impl App {
     pub fn selected_card(&self) -> Option<CardView> {
         let view = self.view.as_ref()?;
         let id = match &self.mode {
-            Mode::Target { targets, sel, .. } => match targets.get(*sel)? {
-                Target::Permanent(id) | Target::Spell(id) => *id,
-                Target::Player(_) => return None,
-            },
+            Mode::Target { targets, sel, .. } => targets.get(*sel)?.object()?,
             Mode::Attack { options, sel, .. } => options.get(*sel)?.attacker,
             Mode::Block {
                 options,
@@ -235,6 +232,7 @@ impl App {
                     .find(|s| s.id == id || s.card.id == id)
                     .map(|s| &s.card)
             })
+            .or_else(|| view.graveyard_card(id).map(|(_, card)| card))
             .cloned()
     }
 

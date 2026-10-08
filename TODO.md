@@ -20,9 +20,9 @@ how the codebase fits together before picking something up.
 - [ ] **Static effects and auras/equipment** (layers-lite).
 - [ ] **Tokens, counters (+1/+1), exile, "dies" triggers.**
 - [ ] **Hexproof / shroud / protection** (they affect `valid_targets`).
-- [ ] Zone changes keep the same `ObjectId`. Real MTG makes a new object, which
-      would fix edge cases such as a spell still targeting a creature that was
-      bounced and recast.
+- [x] A card that changes zones is treated as a new object for targeting
+      (`Object::moves`), so blink and bounce-and-recast make spells fizzle.
+      Its `ObjectId` is still reused, which is fine for everything so far.
 
 ## Multiplayer & Commander
 
@@ -39,12 +39,29 @@ how the codebase fits together before picking something up.
 - [x] Card packs: extra cards and decks loaded from TOML (`--cards`), added
       to the built-in pool (`magus-core/src/pool.rs`). Built-in cards stay in
       Rust for now.
-- [ ] **Event-driven triggers**: an event queue (`Entered`, `DamageDealt`,
-      `Died`…) checked in `settle()`, so abilities can trigger on more than
-      entering. Then `Trigger::DealsCombatDamageToPlayer`, `Who::ThatPlayer`,
-      `Effect::LoseGame`, and `Condition` (with `cast_from` on objects).
-      Test card: a "Blightmaw Tyrant" fixture pack (enters: you lose unless it
-      was cast from the command zone; combat damage to a player: they lose).
+- [x] Event-driven triggers (`Game::fire` → `stack_triggers` in `settle`),
+      `DealsCombatDamageToPlayer`, `Who::ThatPlayer`, `LoseGame`, and
+      `Condition` on how a permanent was cast. Test pack: `blightmaw.toml`.
+- [ ] More triggers: "dies" (needs the dying card's abilities to be read
+      from the graveyard), "attacks", "beginning of your upkeep", and
+      "another creature enters" (the `Event` match in `fire` already scans
+      the whole battlefield).
+- [ ] When one player has several triggers at once, let them choose the
+      order (a new `Prompt`). They currently resolve in the order they
+      triggered.
+- [x] Alternate paths, first slice: target a creature card in your
+      graveyard; `return_to_battlefield`, `return_to_hand`, `blink`. Built-in
+      cards: Call from the Mire, Gravecall Wraith, Mossgrave Recovery,
+      Veilstep.
+- [ ] Alternate paths, next: a keyword for casting from the graveyard
+      (`legal_plays` offers graveyard cards; `CastZone::Graveyard`), and "put
+      a creature card from your hand onto the battlefield" (a non-target
+      choice, so a new `Pending`/`Prompt`).
+- [ ] Target restrictions such as "creature you control" or "card in any
+      graveyard". These are new `TargetKind`s; if they multiply, switch to a
+      filter struct (zone, card type, whose).
+- [ ] An exile zone. `blink` exiles and returns at once, so nothing needs to
+      stay exiled yet.
 - [ ] The bot only knows built-in cards (`cards::card`), so it never casts a
       pack's targeted spells. It needs card definitions from the server (see
       next item), or a hint in the prompt about what a spell does.

@@ -1,0 +1,27 @@
+# A card whose abilities end the game. Too swingy for the sample decks, so tests
+# load it on its own.
+
+# A huge threat you have to pay for honestly: if it reaches the battlefield any
+# way other than being cast from your hand (say, returned from the graveyard),
+# you lose. Once it's out, any combat damage it deals to a player knocks that
+# player out.
+[[card]]
+key = "blightmaw-tyrant"
+name = "Blightmaw Tyrant"
+type = "creature"
+cost = "4BBB"
+subtype = "Dragon"
+power = 7
+toughness = 7
+keywords = ["flying"]
+
+[[card.ability]]
+type = "triggered"
+when = "enters"
+only_if = { type = "not_cast_from", zone = "hand" }
+effects = [{ type = "lose_game", who = "you" }]
+
+[[card.ability]]
+type = "triggered"
+when = "deals_combat_damage_to_player"
+effects = [{ type = "lose_game", who = "that_player" }]

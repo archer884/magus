@@ -10,7 +10,9 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::card::{Ability, CardDef, CardKind, Effect, Keyword, TargetKind, Trigger, Who};
+use crate::card::{
+    Ability, CardDef, CardKind, CastZone, Condition, Effect, Keyword, TargetKind, Trigger, Who,
+};
 use crate::cards::DeckList;
 use crate::mana::{Color, plan_payment};
 use crate::pool::CardPool;
@@ -36,6 +38,18 @@ pub enum Target {
     Player(PlayerId),
     Permanent(ObjectId),
     Spell(ObjectId),
+    /// A card in a graveyard.
+    GraveyardCard(ObjectId),
+}
+
+impl Target {
+    /// The object targeted, if it isn't a player.
+    pub fn object(self) -> Option<ObjectId> {
+        match self {
+            Target::Player(_) => None,
+            Target::Permanent(id) | Target::Spell(id) | Target::GraveyardCard(id) => Some(id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +163,14 @@ struct Object {
     deathtouched: bool,
     power_mod: i32,
     toughness_mod: i32,
+    /// Where this permanent was cast from, if it was cast. Cleared when it
+    /// moves anywhere but from the stack to the battlefield.
+    cast_from: Option<CastZone>,
+    /// How many times this card has changed zones. In the real rules a card
+    /// that changes zones becomes a new object; we keep its id, so a spell
+    /// remembers this count for its target and loses track of the target if
+    /// it changes (see `StackItem::target_moves`).
+    moves: u32,
 }
 
 impl Object {
@@ -189,6 +211,10 @@ struct StackItem {
     controller: PlayerId,
     kind: StackKind,
     target: Option<Target>,
+    /// For a triggered ability, the player in its event ([`Who::ThatPlayer`]).
+    that_player: Option<PlayerId>,
+    /// If the target is an object, its `moves` when it was targeted.
+    target_moves: Option<u32>,
 }
 
 impl StackItem {
@@ -202,6 +228,22 @@ enum StackKind {
     Spell,
     /// A triggered ability: an index into the source card's `abilities`.
     Ability(usize),
+}
+
+/// A triggered ability waiting to go on the stack.
+#[derive(Debug, Clone, Copy)]
+struct Triggered {
+    source: ObjectId,
+    controller: PlayerId,
+    ability: usize,
+    that_player: Option<PlayerId>,
+}
+
+/// Something that happened which abilities can trigger on.
+#[derive(Debug, Clone, Copy)]
+enum Event {
+    Entered(ObjectId),
+    CombatDamageToPlayer { source: ObjectId, player: PlayerId },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -237,6 +279,9 @@ pub struct Game {
     passes: usize,
     land_played: bool,
     combat: Combat,
+    /// Abilities that have triggered but aren't on the stack yet. They go on
+    /// the next time a player would get priority (see `settle`).
+    triggered: Vec<Triggered>,
     next_id: u32,
     version: u64,
     rng: StdRng,
@@ -260,6 +305,7 @@ impl Game {
             passes: 0,
             land_played: false,
             combat: Combat::default(),
+            triggered: Vec::new(),
             next_id: 1,
             version: 0,
             rng: StdRng::seed_from_u64(seed),
@@ -515,6 +561,8 @@ impl Game {
                 deathtouched: false,
                 power_mod: 0,
                 toughness_mod: 0,
+                cast_from: None,
+                moves: 0,
             },
         );
         id
@@ -580,13 +628,19 @@ impl Game {
         if zone != Zone::Battlefield {
             o.controller = o.owner;
         }
+        if !(from == Zone::Stack && zone == Zone::Battlefield) {
+            o.cast_from = None;
+        }
+        o.moves += 1;
     }
 
     fn draw(&mut self, p: PlayerId) {
         match self.players[p].library.pop() {
             Some(id) => {
                 self.players[p].hand.push(id);
-                self.objects.get_mut(&id).expect("object exists").zone = Zone::Hand;
+                let o = self.objects.get_mut(&id).expect("object exists");
+                o.zone = Zone::Hand;
+                o.moves += 1;
             }
             None => self.players[p].drew_from_empty = true,
         }
@@ -747,7 +801,11 @@ impl Game {
             if self.players[self.active].lost {
                 let next = self.next_living(self.active);
                 self.stack.clear();
+                self.triggered.clear();
                 self.start_turn(next);
+                continue;
+            }
+            if self.stack_triggers() {
                 continue;
             }
             match self.pending {
@@ -823,6 +881,7 @@ impl Game {
                 }
             }
             self.stack.retain(|s| s.controller != p);
+            self.triggered.retain(|s| s.controller != p);
             self.combat.attacks.retain(|a| a.defender != p);
             self.combat.to_declare.retain(|&d| d != p);
         }
@@ -860,7 +919,7 @@ impl Game {
             let targets = match def.spell_target() {
                 None => None,
                 Some(kind) => {
-                    let targets = self.valid_targets(kind);
+                    let targets = self.valid_targets(kind, p);
                     if targets.is_empty() {
                         continue;
                     }
@@ -876,7 +935,8 @@ impl Game {
         plays
     }
 
-    fn valid_targets(&self, kind: TargetKind) -> Vec<Target> {
+    /// Everything a spell controlled by `caster` that targets `kind` could target.
+    fn valid_targets(&self, kind: TargetKind, caster: PlayerId) -> Vec<Target> {
         let mut targets = Vec::new();
         if matches!(kind, TargetKind::Any | TargetKind::Player) {
             targets.extend(self.living().map(Target::Player));
@@ -897,13 +957,31 @@ impl Game {
                     .map(|s| Target::Spell(s.id)),
             );
         }
+        if kind == TargetKind::CreatureCardInYourGraveyard {
+            targets.extend(
+                self.players[caster]
+                    .graveyard
+                    .iter()
+                    .filter(|id| self.objects[id].is_creature())
+                    .map(|&id| Target::GraveyardCard(id)),
+            );
+        }
         targets
+    }
+
+    /// Whether `target`, chosen when `item` was put on the stack, is still
+    /// legal: still a valid target, and (for objects) not moved since.
+    fn target_still_legal(&self, item: &StackItem, kind: TargetKind, target: Target) -> bool {
+        self.valid_targets(kind, item.controller).contains(&target)
+            && target.object().map(|id| self.objects[&id].moves) == item.target_moves
     }
 
     fn describe_target(&self, target: Target) -> String {
         match target {
             Target::Player(p) => self.name(p).to_string(),
-            Target::Permanent(id) | Target::Spell(id) => self.card_name(id).to_string(),
+            Target::Permanent(id) | Target::Spell(id) | Target::GraveyardCard(id) => {
+                self.card_name(id).to_string()
+            }
         }
     }
 
@@ -919,6 +997,7 @@ impl Game {
         self.land_played = true;
         self.passes = 0;
         self.log(format!("{} plays {}.", self.name(p), self.card_name(card)));
+        self.fire(Event::Entered(card));
         Ok(())
     }
 
@@ -949,12 +1028,17 @@ impl Game {
             self.objects.get_mut(&land).expect("land exists").tapped = true;
         }
         self.move_to(card, Zone::Stack);
+        self.objects.get_mut(&card).expect("card exists").cast_from = Some(CastZone::Hand);
         self.stack.push(StackItem {
             id: card,
             source: card,
             controller: p,
             kind: StackKind::Spell,
             target,
+            that_player: None,
+            target_moves: target
+                .and_then(Target::object)
+                .map(|id| self.objects[&id].moves),
         });
         let aim = target
             .map(|t| format!(" targeting {}", self.describe_target(t)))
@@ -968,7 +1052,7 @@ impl Game {
     fn resolve(&mut self, item: StackItem) {
         let def = self.objects[&item.source].def;
         if let (Some(target), Some(kind)) = (item.target, def.spell_target())
-            && !self.valid_targets(kind).contains(&target)
+            && !self.target_still_legal(&item, kind, target)
         {
             self.log(format!("{} fizzles: its target is gone.", def.name));
             if item.is_spell() {
@@ -983,64 +1067,160 @@ impl Game {
                 .expect("object exists")
                 .controller = item.controller;
             self.log(format!("{} enters the battlefield.", def.name));
-            self.trigger(item.id, Trigger::Enters);
+            self.fire(Event::Entered(item.id));
             return;
         }
         let effects = match item.kind {
             StackKind::Spell => def.effects,
             StackKind::Ability(i) => {
+                let Ability::Triggered {
+                    only_if, effects, ..
+                } = def.abilities[i];
+                // Checked again on resolution. If the source has left the
+                // battlefield, go by how it was when it triggered, as the
+                // real rules do ("last known information").
+                if let Some(condition) = only_if
+                    && self.on_battlefield(item.source)
+                    && !self.holds(condition, item.source)
+                {
+                    self.log(format!(
+                        "{}'s ability does nothing: its condition no longer holds.",
+                        def.name
+                    ));
+                    return;
+                }
                 self.log(format!("{}'s ability resolves.", def.name));
-                let Ability::Triggered { effects, .. } = def.abilities[i];
                 effects
             }
         };
         for effect in effects {
-            self.apply_effect(*effect, item.source, item.controller, item.target);
+            self.apply_effect(*effect, &item);
         }
         if item.is_spell() {
             self.move_to(item.id, Zone::Graveyard);
         }
     }
 
-    /// Puts each of `source`'s abilities that trigger on `event` onto the stack.
-    fn trigger(&mut self, source: ObjectId, event: Trigger) {
-        let o = &self.objects[&source];
-        let (def, controller) = (o.def, o.controller);
-        // Pushed in reverse so that they resolve in the order printed on the card.
-        for (i, ability) in def.abilities.iter().enumerate().rev() {
-            let Ability::Triggered { when, .. } = ability;
-            if *when != event {
-                continue;
+    /// Notes every ability that triggers on `event`. They wait in
+    /// `self.triggered` until [`Game::stack_triggers`] puts them on the stack.
+    fn fire(&mut self, event: Event) {
+        for &id in &self.battlefield {
+            let o = &self.objects[&id];
+            for (i, ability) in o.def.abilities.iter().enumerate() {
+                let Ability::Triggered { when, only_if, .. } = *ability;
+                let that_player = match (when, event) {
+                    (Trigger::Enters, Event::Entered(entered)) if entered == id => None,
+                    (
+                        Trigger::DealsCombatDamageToPlayer,
+                        Event::CombatDamageToPlayer { source, player },
+                    ) if source == id => Some(player),
+                    _ => continue,
+                };
+                if only_if.is_some_and(|c| !self.holds(c, id)) {
+                    continue;
+                }
+                self.triggered.push(Triggered {
+                    source: id,
+                    controller: o.controller,
+                    ability: i,
+                    that_player,
+                });
             }
-            let id = self.fresh_id();
-            self.stack.push(StackItem {
-                id,
-                source,
-                controller,
-                kind: StackKind::Ability(i),
-                target: None,
-            });
-            self.log(format!("{}'s ability triggers.", def.name));
         }
     }
 
-    fn apply_effect(
-        &mut self,
-        effect: Effect,
-        source: ObjectId,
-        controller: PlayerId,
-        target: Option<Target>,
-    ) {
+    /// Whether `condition` is true of the permanent `source`.
+    fn holds(&self, condition: Condition, source: ObjectId) -> bool {
+        let cast_from = self.objects[&source].cast_from;
+        match condition {
+            Condition::CastFrom { zone } => cast_from == Some(zone),
+            Condition::NotCastFrom { zone } => cast_from != Some(zone),
+        }
+    }
+
+    /// Puts waiting triggered abilities on the stack and gives the active
+    /// player priority. Returns whether there were any.
+    ///
+    /// The active player's go on first, then each other player's in turn
+    /// order, so the last player's resolve first (the real rules' "APNAP"
+    /// order). Each player's own resolve in the order they triggered; real
+    /// players would get to choose.
+    fn stack_triggers(&mut self) -> bool {
+        let mut waiting = std::mem::take(&mut self.triggered);
+        waiting.retain(|t| !self.players[t.controller].lost);
+        if waiting.is_empty() {
+            return false;
+        }
+        let n = self.players.len();
+        let active = self.active;
+        waiting.sort_by_key(|t| (t.controller + n - active) % n);
+        for group in waiting.chunk_by(|a, b| a.controller == b.controller) {
+            for t in group.iter().rev() {
+                let name = self.card_name(t.source);
+                self.log(format!("{name}'s ability triggers."));
+                let id = self.fresh_id();
+                self.stack.push(StackItem {
+                    id,
+                    source: t.source,
+                    controller: t.controller,
+                    kind: StackKind::Ability(t.ability),
+                    target: None,
+                    that_player: t.that_player,
+                    target_moves: None,
+                });
+            }
+        }
+        self.passes = 0;
+        self.give_priority(self.active);
+        true
+    }
+
+    fn apply_effect(&mut self, effect: Effect, item: &StackItem) {
+        let (source, controller, target) = (item.source, item.controller, item.target);
+        let players = |game: &Game, who| game.players_for(who, controller, item.that_player);
         match effect {
             Effect::Damage { amount, .. } => {
                 if let Some(t) = target {
-                    self.deal_damage(source, t, amount);
+                    self.deal_damage(source, t, amount, false);
                 }
             }
             Effect::Destroy => {
                 if let Some(Target::Permanent(id)) = target {
                     self.log(format!("{} is destroyed.", self.card_name(id)));
                     self.move_to(id, Zone::Graveyard);
+                }
+            }
+            Effect::ReturnToBattlefield => {
+                if let Some(Target::GraveyardCard(id)) = target {
+                    self.move_to(id, Zone::Battlefield);
+                    self.objects.get_mut(&id).expect("object exists").controller = controller;
+                    self.log(format!(
+                        "{} returns to the battlefield under {}'s control.",
+                        self.card_name(id),
+                        self.name(controller)
+                    ));
+                    self.fire(Event::Entered(id));
+                }
+            }
+            Effect::ReturnToHand => {
+                if let Some(Target::GraveyardCard(id)) = target {
+                    let owner = self.objects[&id].owner;
+                    self.log(format!(
+                        "{} returns to {}'s hand.",
+                        self.card_name(id),
+                        self.name(owner)
+                    ));
+                    self.move_to(id, Zone::Hand);
+                }
+            }
+            Effect::Blink => {
+                if let Some(Target::Permanent(id)) = target {
+                    self.move_to(id, Zone::Battlefield);
+                    let o = self.objects.get_mut(&id).expect("object exists");
+                    o.controller = o.owner;
+                    let name = o.def.name;
+                    self.log(format!("{name} is exiled and returns to the battlefield."));
+                    self.fire(Event::Entered(id));
                 }
             }
             Effect::Bounce => {
@@ -1072,7 +1252,7 @@ impl Game {
                 }
             }
             Effect::Draw { who, count } => {
-                for q in self.players_for(who, controller) {
+                for q in players(self, who) {
                     for _ in 0..count {
                         self.draw(q);
                     }
@@ -1085,34 +1265,51 @@ impl Game {
                 }
             }
             Effect::GainLife { who, amount } => {
-                for q in self.players_for(who, controller) {
+                for q in players(self, who) {
                     self.players[q].life += amount;
                     self.log(format!("{} gains {amount} life.", self.name(q)));
                 }
             }
             Effect::LoseLife { who, amount } => {
-                for q in self.players_for(who, controller) {
+                for q in players(self, who) {
                     self.players[q].life -= amount;
                     self.log(format!("{} loses {amount} life.", self.name(q)));
                 }
             }
             Effect::DamagePlayers { who, amount } => {
-                for q in self.players_for(who, controller) {
-                    self.deal_damage(source, Target::Player(q), amount);
+                for q in players(self, who) {
+                    self.deal_damage(source, Target::Player(q), amount, false);
+                }
+            }
+            Effect::LoseGame { who } => {
+                let why = format!("loses the game ({})", self.card_name(source));
+                for q in players(self, who) {
+                    self.lose(q, &why);
                 }
             }
         }
     }
 
     /// The players `who` refers to, for an effect controlled by `controller`.
-    fn players_for(&self, who: Who, controller: PlayerId) -> Vec<PlayerId> {
-        match who {
+    /// Players who have already lost are left out.
+    fn players_for(
+        &self,
+        who: Who,
+        controller: PlayerId,
+        that_player: Option<PlayerId>,
+    ) -> Vec<PlayerId> {
+        let players = match who {
             Who::You => vec![controller],
             Who::EachOpponent => self.living().filter(|&q| q != controller).collect(),
-        }
+            Who::ThatPlayer => that_player.into_iter().collect(),
+        };
+        players
+            .into_iter()
+            .filter(|&q| !self.players[q].lost)
+            .collect()
     }
 
-    fn deal_damage(&mut self, source: ObjectId, target: Target, amount: i32) {
+    fn deal_damage(&mut self, source: ObjectId, target: Target, amount: i32, combat: bool) {
         if amount <= 0 {
             return;
         }
@@ -1130,6 +1327,9 @@ impl Game {
                     "{src_name} deals {amount} damage to {}.",
                     self.name(p)
                 ));
+                if combat {
+                    self.fire(Event::CombatDamageToPlayer { source, player: p });
+                }
             }
             Target::Permanent(id) => {
                 if !self.on_battlefield(id) {
@@ -1141,7 +1341,8 @@ impl Game {
                 let name = o.def.name;
                 self.log(format!("{src_name} deals {amount} damage to {name}."));
             }
-            Target::Spell(_) => return,
+            // Validation keeps damage from targeting these.
+            Target::Spell(_) | Target::GraveyardCard(_) => return,
         }
         if lifelink {
             self.players[src_controller].life += amount;
@@ -1330,7 +1531,7 @@ impl Game {
             }
         }
         for (source, target, amount) in hits {
-            self.deal_damage(source, target, amount);
+            self.deal_damage(source, target, amount, true);
         }
     }
 
@@ -1363,7 +1564,7 @@ impl Game {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cards::DECKS;
+    use crate::cards::{self, DECKS};
 
     /// A game with empty hands and battlefields on player 0's first main phase.
     fn blank_game() -> Game {
@@ -1615,6 +1816,7 @@ mod tests {
             abilities: &[
                 Ability::Triggered {
                     when: Trigger::Enters,
+                    only_if: None,
                     effects: &[Effect::GainLife {
                         who: Who::You,
                         amount: 3,
@@ -1622,6 +1824,7 @@ mod tests {
                 },
                 Ability::Triggered {
                     when: Trigger::Enters,
+                    only_if: None,
                     effects: &[Effect::LoseLife {
                         who: Who::EachOpponent,
                         amount: 1,
@@ -1640,6 +1843,283 @@ mod tests {
         assert_eq!(g.players[1].life, 19);
         let line = |text: &str| g.log.iter().position(|l| l == text).unwrap();
         assert!(line("Ann gains 3 life.") < line("Bob loses 1 life."));
+    }
+
+    /// A card from the Blightmaw test pack (`tests/fixtures/blightmaw.toml`).
+    fn blightmaw_card(key: &str) -> &'static CardDef {
+        static POOL: std::sync::OnceLock<CardPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let mut pool = CardPool::builtin();
+            let pack = toml::from_str(include_str!("../tests/fixtures/blightmaw.toml")).unwrap();
+            pool.add_pack(pack).unwrap();
+            pool
+        })
+        .card(key)
+        .unwrap()
+    }
+
+    fn cast_from_hand(g: &mut Game, p: PlayerId, def: &'static CardDef) -> ObjectId {
+        let card = g.create(def, p, Zone::Hand);
+        g.players[p].hand.push(card);
+        g.apply(p, Action::Cast { card, target: None }).unwrap();
+        card
+    }
+
+    #[test]
+    fn blightmaw_rules_text() {
+        assert_eq!(
+            blightmaw_card("blightmaw-tyrant").rules_text(),
+            "Flying\n\
+             When this creature enters, if you didn't cast it from your hand, you lose the \
+             game.\n\
+             Whenever this creature deals combat damage to a player, that player loses the game."
+        );
+    }
+
+    /// Casts Blightmaw from Ann's hand and lets it resolve.
+    fn cast_blightmaw() -> (Game, ObjectId) {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 7);
+        let tyrant = cast_from_hand(&mut g, 0, blightmaw_card("blightmaw-tyrant"));
+        pass_until(&mut g, |g| g.stack.is_empty() && g.on_battlefield(tyrant));
+        (g, tyrant)
+    }
+
+    #[test]
+    fn blightmaw_cast_from_hand_is_safe() {
+        let (g, _) = cast_blightmaw();
+        assert!(!g.is_over());
+        assert!(
+            !g.log.iter().any(|l| l.contains("ability triggers")),
+            "the condition is false, so the ability doesn't even trigger"
+        );
+    }
+
+    #[test]
+    fn blightmaw_reanimated_loses_you_the_game() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 4);
+        let tyrant = in_graveyard(&mut g, 0, blightmaw_card("blightmaw-tyrant"));
+        cast_at(
+            &mut g,
+            0,
+            "call-from-the-mire",
+            Target::GraveyardCard(tyrant),
+        );
+        pass_until(&mut g, |g| g.is_over());
+        assert!(g.on_battlefield(tyrant));
+        assert_eq!(g.result(), Some(Some(1)), "Bob wins");
+        assert!(
+            g.log
+                .contains(&"Ann loses the game (Blightmaw Tyrant).".to_string())
+        );
+    }
+
+    #[test]
+    fn blightmaw_blinked_loses_you_the_game() {
+        // It was cast from hand, but the blinked one is a new object that wasn't.
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 7);
+        lands(&mut g, 0, "meadow", 2);
+        put(&mut g, 0, "veilstep", Zone::Hand);
+        let tyrant = cast_from_hand(&mut g, 0, blightmaw_card("blightmaw-tyrant"));
+        pass_until(&mut g, |g| g.stack.is_empty() && g.on_battlefield(tyrant));
+        assert!(!g.is_over());
+        let veilstep = *g.players[0].hand.last().unwrap();
+        g.apply(
+            0,
+            Action::Cast {
+                card: veilstep,
+                target: Some(Target::Permanent(tyrant)),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.is_over());
+        assert_eq!(g.result(), Some(Some(1)));
+    }
+
+    /// Ann casts Blightmaw, and on her next turn attacks Bob with it.
+    fn blightmaw_attacks(blocker: Option<&str>) -> (Game, ObjectId) {
+        let (mut g, tyrant) = cast_blightmaw();
+        pass_until(&mut g, |g| g.pending == Pending::Attackers(0));
+        // Added only now so that Bob, with nothing to do, skips his own turn.
+        let blocker = blocker.map(|key| put(&mut g, 1, key, Zone::Battlefield));
+        let attacks = vec![Attack {
+            attacker: tyrant,
+            defender: 1,
+        }];
+        g.apply(0, Action::DeclareAttackers { attacks }).unwrap();
+        if let Some(blocker) = blocker {
+            let blocks = vec![Block {
+                blocker,
+                attacker: tyrant,
+            }];
+            g.apply(1, Action::DeclareBlockers { blocks }).unwrap();
+        }
+        (g, tyrant)
+    }
+
+    #[test]
+    fn blightmaw_combat_damage_to_a_player_ends_their_game() {
+        let (mut g, _) = blightmaw_attacks(None);
+        pass_until(&mut g, |g| g.is_over());
+        assert_eq!(
+            g.players[1].life,
+            STARTING_LIFE - 7,
+            "the damage happened first"
+        );
+        assert_eq!(g.result(), Some(Some(0)), "Ann wins");
+        assert!(
+            g.log
+                .contains(&"Bob loses the game (Blightmaw Tyrant).".to_string())
+        );
+    }
+
+    #[test]
+    fn blightmaw_blocked_deals_no_damage_to_the_player() {
+        let (mut g, _) = blightmaw_attacks(Some("skyward-kestrel"));
+        pass_until(&mut g, |g| g.step == Step::Main2);
+        assert!(!g.is_over());
+        assert_eq!(g.players[1].life, STARTING_LIFE);
+    }
+
+    /// Puts a card from the pool into `p`'s graveyard.
+    fn in_graveyard(g: &mut Game, p: PlayerId, def: &'static CardDef) -> ObjectId {
+        let id = g.create(def, p, Zone::Graveyard);
+        g.players[p].graveyard.push(id);
+        id
+    }
+
+    fn cast_at(g: &mut Game, p: PlayerId, key: &str, target: Target) -> ObjectId {
+        let card = put(g, p, key, Zone::Hand);
+        g.apply(
+            p,
+            Action::Cast {
+                card,
+                target: Some(target),
+            },
+        )
+        .unwrap();
+        card
+    }
+
+    #[test]
+    fn condition_checks_how_a_permanent_arrived() {
+        let wraith = cards::card("gravecall-wraith").unwrap();
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 4);
+        let cast = cast_from_hand(&mut g, 0, wraith);
+        pass_until(&mut g, |g| g.stack.is_empty() && g.on_battlefield(cast));
+        assert!(g.players[0].hand.is_empty(), "cast from hand: no cards");
+        // Bouncing it forgets how it was cast.
+        g.move_to(cast, Zone::Hand);
+        assert_eq!(g.objects[&cast].cast_from, None);
+
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 4);
+        let dead = in_graveyard(&mut g, 0, wraith);
+        cast_at(&mut g, 0, "call-from-the-mire", Target::GraveyardCard(dead));
+        pass_until(&mut g, |g| g.stack.is_empty() && g.on_battlefield(dead));
+        assert_eq!(
+            g.players[0].hand.len(),
+            2,
+            "returned from the graveyard: draw 2"
+        );
+    }
+
+    #[test]
+    fn graveyard_targets_are_described_for_clients() {
+        let mut g = blank_game();
+        let stalker = in_graveyard(&mut g, 0, cards::card("fen-stalker").unwrap());
+        assert_eq!(
+            g.view(1).describe_target(&Target::GraveyardCard(stalker)),
+            "Fen Stalker (in Ann's graveyard)"
+        );
+    }
+
+    #[test]
+    fn return_to_hand_from_graveyard() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "thicket", 2);
+        let boar = in_graveyard(&mut g, 0, cards::card("thornback-boar").unwrap());
+        cast_at(&mut g, 0, "mossgrave-recovery", Target::GraveyardCard(boar));
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&boar].zone, Zone::Hand);
+        assert!(g.players[0].hand.contains(&boar));
+    }
+
+    #[test]
+    fn graveyard_targets_are_only_your_creature_cards() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 4);
+        let mine = in_graveyard(&mut g, 0, cards::card("fen-stalker").unwrap());
+        in_graveyard(&mut g, 0, cards::card("blaze").unwrap());
+        in_graveyard(&mut g, 1, cards::card("night-leech").unwrap());
+        let call = put(&mut g, 0, "call-from-the-mire", Zone::Hand);
+        let plays = g.legal_plays(0);
+        let play = plays.iter().find(|o| o.card == call).unwrap();
+        assert_eq!(play.targets, Some(vec![Target::GraveyardCard(mine)]));
+    }
+
+    #[test]
+    fn a_target_that_moves_away_and_back_is_lost() {
+        // The card that comes back to the graveyard is a new object as far as
+        // the rules are concerned, so the spell no longer knows about it.
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 4);
+        // An instant Ann could still cast, so she keeps priority after casting.
+        lands(&mut g, 0, "meadow", 1);
+        put(&mut g, 0, "mending-light", Zone::Hand);
+        let stalker = in_graveyard(&mut g, 0, cards::card("fen-stalker").unwrap());
+        cast_at(
+            &mut g,
+            0,
+            "call-from-the-mire",
+            Target::GraveyardCard(stalker),
+        );
+        assert_eq!(g.stack.len(), 1, "not resolved yet");
+        g.move_to(stalker, Zone::Hand);
+        g.move_to(stalker, Zone::Graveyard);
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert_eq!(g.objects[&stalker].zone, Zone::Graveyard);
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Call from the Mire fizzles: its target is gone.")
+        );
+    }
+
+    #[test]
+    fn blink_saves_a_creature_from_removal() {
+        let mut g = blank_game();
+        lands(&mut g, 0, "bog", 3);
+        lands(&mut g, 1, "meadow", 2);
+        let pilgrim = put(&mut g, 1, "lantern-pilgrim", Zone::Battlefield);
+        put(&mut g, 1, "veilstep", Zone::Hand);
+        cast_at(&mut g, 0, "grasp-of-ruin", Target::Permanent(pilgrim));
+        // Ann has nothing else to do, so Bob gets priority and responds.
+        assert_eq!(g.waiting_on(), Some(1));
+        let veilstep = *g.players[1].hand.last().unwrap();
+        g.apply(
+            1,
+            Action::Cast {
+                card: veilstep,
+                target: Some(Target::Permanent(pilgrim)),
+            },
+        )
+        .unwrap();
+        pass_until(&mut g, |g| g.stack.is_empty());
+        assert!(g.on_battlefield(pilgrim), "the pilgrim survives");
+        assert!(
+            g.log
+                .iter()
+                .any(|l| l == "Grasp of Ruin fizzles: its target is gone.")
+        );
+        assert_eq!(
+            g.players[1].life,
+            STARTING_LIFE + 2,
+            "and its enters ability happened again"
+        );
     }
 
     #[test]

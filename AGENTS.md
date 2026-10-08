@@ -80,15 +80,29 @@ Key files in core:
 
 - Library top = end of `Vec`. `ObjectId`s are assigned *after* shuffling so
   they leak no card info.
-- Objects keep their `ObjectId` across zone changes (a known simplification;
-  see TODO). `move_to` resets per-battlefield state and removes the object from
-  combat.
+- Objects keep their `ObjectId` across zone changes, but `Object::moves`
+  counts them. In the real rules a card that changes zones is a new object;
+  we get the same effect by recording the target's `moves` on the stack item
+  (`target_moves`) and treating a mismatch as "target gone"
+  (`target_still_legal`). So any zone change, including battlefield →
+  battlefield (blink), must go through `move_to`, which bumps the count,
+  resets per-battlefield state and removes the object from combat. `draw`
+  bumps it too.
+- `valid_targets(kind, caster)` takes the caster, because some kinds (e.g.
+  `CreatureCardInYourGraveyard`) depend on whose spell it is.
 - Stack items: spells use the card's id; triggered abilities get a fresh id
   that is *not* in `objects`. Use `item.source` for the card, and
   `StackKind::Ability(i)` for which of its `abilities` is resolving.
-- `Game::trigger(source, event)` puts a permanent's matching abilities on the
-  stack, in reverse so they resolve in printed order. Only `Trigger::Enters`
-  is fired so far (from `resolve`).
+- Triggers: things that happen call `Game::fire(Event)`, which records each
+  matching ability (if its `only_if` holds) in `self.triggered`. They go on
+  the stack in `settle` (`stack_triggers`), the next time anyone would get
+  priority, in APNAP order. This is why abilities of a creature that dies in
+  the same combat still trigger: they're recorded before state-based
+  actions run. To add a trigger: a `Trigger` variant, an `Event` variant if
+  needed, a `fire` call where it happens, and the match arm in `fire`. Set
+  `Trigger::has_player` if effects may use `Who::ThatPlayer`.
+- `Object::cast_from` is set by `cast()` and cleared by `move_to` for any move
+  except stack → battlefield, so bounced-and-recast cards don't remember.
 - Combat damage is computed first, then applied, so it's simultaneous.
   Attackers assign damage to blockers in block order.
 - Mana is paid automatically; basic lands only, so greedy payment is exact.

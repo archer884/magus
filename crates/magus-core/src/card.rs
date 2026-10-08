@@ -44,6 +44,8 @@ pub enum TargetKind {
     Creature,
     Player,
     Spell,
+    /// A creature card in the graveyard of whoever controls the spell.
+    CreatureCardInYourGraveyard,
 }
 
 /// Which player(s) an untargeted effect applies to, from the point of view of
@@ -53,6 +55,9 @@ pub enum TargetKind {
 pub enum Who {
     You,
     EachOpponent,
+    /// The player in the event that triggered the ability, e.g. the player
+    /// who was dealt combat damage. Only valid for triggers that involve one.
+    ThatPlayer,
 }
 
 impl Who {
@@ -61,6 +66,7 @@ impl Who {
         match self {
             Who::You => "you",
             Who::EachOpponent => "each opponent",
+            Who::ThatPlayer => "that player",
         }
     }
 
@@ -69,7 +75,7 @@ impl Who {
     fn conjugate(self, verb: &str) -> String {
         match self {
             Who::You => verb.to_string(),
-            Who::EachOpponent => format!("{verb}s"),
+            Who::EachOpponent | Who::ThatPlayer => format!("{verb}s"),
         }
     }
 }
@@ -109,18 +115,55 @@ pub enum Effect {
         who: Who,
         amount: i32,
     },
+    LoseGame {
+        who: Who,
+    },
+    /// Puts the targeted card from a graveyard onto the battlefield under the
+    /// spell's controller's control. It enters, but isn't cast.
+    ReturnToBattlefield,
+    /// Returns the targeted card from a graveyard to its owner's hand.
+    ReturnToHand,
+    /// Exiles the targeted creature and immediately returns it under its
+    /// owner's control, as a new object: spells and abilities aimed at it lose
+    /// track of it, and it enters again.
+    Blink,
 }
 
 impl Effect {
     pub fn target(&self) -> Option<TargetKind> {
         match self {
             Effect::Damage { target, .. } => Some(*target),
-            Effect::Destroy | Effect::Bounce | Effect::Pump { .. } => Some(TargetKind::Creature),
+            Effect::Destroy | Effect::Bounce | Effect::Pump { .. } | Effect::Blink => {
+                Some(TargetKind::Creature)
+            }
+            Effect::ReturnToBattlefield | Effect::ReturnToHand => {
+                Some(TargetKind::CreatureCardInYourGraveyard)
+            }
             Effect::Counter => Some(TargetKind::Spell),
             Effect::Draw { .. }
             | Effect::GainLife { .. }
             | Effect::LoseLife { .. }
-            | Effect::DamagePlayers { .. } => None,
+            | Effect::DamagePlayers { .. }
+            | Effect::LoseGame { .. } => None,
+        }
+    }
+
+    /// The players this effect applies to, if it names them with a [`Who`].
+    pub fn who(&self) -> Option<Who> {
+        match *self {
+            Effect::Draw { who, .. }
+            | Effect::GainLife { who, .. }
+            | Effect::LoseLife { who, .. }
+            | Effect::DamagePlayers { who, .. }
+            | Effect::LoseGame { who } => Some(who),
+            Effect::Damage { .. }
+            | Effect::Destroy
+            | Effect::Bounce
+            | Effect::Pump { .. }
+            | Effect::Counter
+            | Effect::ReturnToBattlefield
+            | Effect::ReturnToHand
+            | Effect::Blink => None,
         }
     }
 
@@ -132,6 +175,9 @@ impl Effect {
                     TargetKind::Creature => "target creature",
                     TargetKind::Player => "target player",
                     TargetKind::Spell => "target spell",
+                    TargetKind::CreatureCardInYourGraveyard => {
+                        "target creature card in your graveyard"
+                    }
                 };
                 format!("deal {amount} damage to {what}")
             }
@@ -161,6 +207,18 @@ impl Effect {
             Effect::DamagePlayers { who, amount } => {
                 format!("deal {amount} damage to {}", who.noun())
             }
+            Effect::LoseGame { who } => {
+                format!("{} {} the game", who.noun(), who.conjugate("lose"))
+            }
+            Effect::ReturnToBattlefield => {
+                "return target creature card from your graveyard to the battlefield".into()
+            }
+            Effect::ReturnToHand => {
+                "return target creature card from your graveyard to your hand".into()
+            }
+            Effect::Blink => "exile target creature, then return it to the battlefield under \
+                              its owner's control"
+                .into(),
         }
     }
 }
@@ -171,6 +229,9 @@ impl Effect {
 pub enum Trigger {
     /// This permanent enters the battlefield.
     Enters,
+    /// This creature deals combat damage to a player, who becomes
+    /// [`Who::ThatPlayer`].
+    DealsCombatDamageToPlayer,
 }
 
 impl Trigger {
@@ -178,20 +239,73 @@ impl Trigger {
     fn describe(self) -> &'static str {
         match self {
             Trigger::Enters => "When this creature enters",
+            Trigger::DealsCombatDamageToPlayer => {
+                "Whenever this creature deals combat damage to a player"
+            }
+        }
+    }
+
+    /// Whether the triggering event involves a player, so that effects can
+    /// refer to [`Who::ThatPlayer`].
+    pub fn has_player(self) -> bool {
+        match self {
+            Trigger::Enters => false,
+            Trigger::DealsCombatDamageToPlayer => true,
+        }
+    }
+}
+
+/// Where a spell was cast from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CastZone {
+    Hand,
+}
+
+impl CastZone {
+    fn describe(self) -> &'static str {
+        match self {
+            CastZone::Hand => "your hand",
+        }
+    }
+}
+
+/// An "if" on a triggered ability. It's checked when the ability triggers,
+/// and again when it resolves: if it's false either time, nothing happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Condition {
+    /// This permanent was cast from `zone`.
+    CastFrom { zone: CastZone },
+    /// This permanent wasn't cast from `zone`, including when it wasn't cast at
+    /// all (put onto the battlefield by an effect).
+    NotCastFrom { zone: CastZone },
+}
+
+impl Condition {
+    fn describe(self) -> String {
+        match self {
+            Condition::CastFrom { zone } => format!("if you cast it from {}", zone.describe()),
+            Condition::NotCastFrom { zone } => {
+                format!("if you didn't cast it from {}", zone.describe())
+            }
         }
     }
 }
 
 /// Something a permanent does beyond its keywords.
 ///
-/// Only serializable for now: deserializing needs owned card data rather than
-/// `&'static` slices.
+/// Only serializable: card packs deserialize into the owned `AbilitySpec`
+/// (see `pool.rs`) because these slices are `&'static`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Ability {
-    /// "When `when`, do `effects`." Goes on the stack when its event happens.
+    /// "When `when`, if `only_if`, do `effects`." Goes on the stack when its
+    /// event happens.
     Triggered {
         when: Trigger,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        only_if: Option<Condition>,
         effects: &'static [Effect],
     },
 }
@@ -199,8 +313,19 @@ pub enum Ability {
 impl Ability {
     pub fn describe(&self) -> String {
         match self {
-            Ability::Triggered { when, effects } => {
-                format!("{}, {}.", when.describe(), describe_effects(effects))
+            Ability::Triggered {
+                when,
+                only_if,
+                effects,
+            } => {
+                let condition = only_if
+                    .map(|c| format!(", {}", c.describe()))
+                    .unwrap_or_default();
+                format!(
+                    "{}{condition}, {}.",
+                    when.describe(),
+                    describe_effects(effects)
+                )
             }
         }
     }
@@ -336,8 +461,33 @@ impl CardDef {
                 }
             }
         }
+        let damages_non_creature = self.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::Damage {
+                    target: TargetKind::Spell | TargetKind::CreatureCardInYourGraveyard,
+                    ..
+                }
+            )
+        });
+        if damages_non_creature {
+            problems.push("damage can only target `any`, `creature` or `player`".into());
+        }
+        if self
+            .effects
+            .iter()
+            .any(|e| e.who() == Some(Who::ThatPlayer))
+        {
+            problems.push("\"that_player\" only works in an ability triggered by a player".into());
+        }
         for (i, ability) in self.abilities.iter().enumerate() {
-            let Ability::Triggered { effects, .. } = ability;
+            let Ability::Triggered { when, effects, .. } = ability;
+            if !when.has_player() && effects.iter().any(|e| e.who() == Some(Who::ThatPlayer)) {
+                problems.push(format!(
+                    "ability {} uses \"that_player\", but its trigger doesn't involve a player",
+                    i + 1
+                ));
+            }
             if effects.is_empty() {
                 problems.push(format!("ability {} has no effects", i + 1));
             }
@@ -399,6 +549,9 @@ mod tests {
     fn serialized_shape() {
         let ability = Ability::Triggered {
             when: Trigger::Enters,
+            only_if: Some(Condition::NotCastFrom {
+                zone: CastZone::Hand,
+            }),
             effects: &[
                 Effect::DamagePlayers {
                     who: Who::EachOpponent,
@@ -412,6 +565,7 @@ mod tests {
             json!({
                 "type": "triggered",
                 "when": "enters",
+                "only_if": { "type": "not_cast_from", "zone": "hand" },
                 "effects": [
                     { "type": "damage_players", "who": "each_opponent", "amount": 2 },
                     { "type": "destroy" },

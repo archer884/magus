@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use magus_core::card::{Effect, Keyword};
+use magus_core::card::{Ability, CardDef, Effect, Keyword, Trigger, Who};
 use magus_core::cards;
 use magus_core::view::{PermanentView, PlayKind, PlayOption, Prompt};
 use magus_core::{Action, Attack, Block, GameView, ObjectId, Step, Target};
@@ -224,12 +224,45 @@ fn pick_target(view: &GameView, effects: &[Effect], targets: &[Target]) -> Optio
                 .max_by_key(|p| p.power.unwrap_or(0))
                 .map(|p| Target::Permanent(p.card.id))
         }
+        Effect::ReturnToBattlefield | Effect::ReturnToHand => targets
+            .iter()
+            .filter_map(|t| match t {
+                Target::GraveyardCard(id) => {
+                    let (_, card) = view.graveyard_card(*id)?;
+                    let def = cards::card(&card.key)?;
+                    (!loses_on_entering(def)).then_some((*t, card_value(def)))
+                }
+                _ => None,
+            })
+            .max_by_key(|(_, value)| *value)
+            .map(|(t, _)| t),
+        // Keep it to save a creature: blink it in response to a spell aimed at it.
+        Effect::Blink => view
+            .stack
+            .last()
+            .filter(|s| s.controller != view.you)
+            .and_then(|s| s.target)
+            .filter(|t| matches!(t, Target::Permanent(id) if view.permanent(*id).is_some_and(|p| p.controller == view.you)))
+            .filter(|t| targets.contains(t)),
         Effect::Counter => targets
             .iter()
             .find(|t| matches!(t, Target::Spell(id) if view.stack_item(*id).is_some_and(|s| s.controller != view.you)))
             .copied(),
         _ => targets.first().copied(),
     }
+}
+
+/// How much the bot wants a creature card back.
+fn card_value(def: &CardDef) -> i32 {
+    def.power().unwrap_or(0) * 2 + def.toughness().unwrap_or(0) + 3 * def.abilities.len() as i32
+}
+
+/// Whether a card makes its controller lose when it enters without being cast.
+fn loses_on_entering(def: &CardDef) -> bool {
+    def.abilities.iter().any(|a| {
+        let Ability::Triggered { when, effects, .. } = a;
+        *when == Trigger::Enters && effects.contains(&Effect::LoseGame { who: Who::You })
+    })
 }
 
 fn should_attack(view: &GameView, attacker: ObjectId) -> bool {

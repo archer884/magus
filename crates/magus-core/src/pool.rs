@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use crate::card::{Ability, CardDef, CardKind, Effect, Keyword, Trigger};
+use crate::card::{Ability, CardDef, CardKind, Condition, Effect, Keyword, Trigger};
 use crate::cards::{self, DeckList};
 use crate::mana::Color;
 
@@ -65,7 +65,12 @@ pub enum SpecKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AbilitySpec {
-    Triggered { when: Trigger, effects: Vec<Effect> },
+    Triggered {
+        when: Trigger,
+        #[serde(default)]
+        only_if: Option<Condition>,
+        effects: Vec<Effect>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,8 +263,13 @@ fn build_card(spec: CardSpec) -> Result<&'static CardDef, Vec<String>> {
             .abilities
             .into_iter()
             .map(|a| match a {
-                AbilitySpec::Triggered { when, effects } => Ability::Triggered {
+                AbilitySpec::Triggered {
                     when,
+                    only_if,
+                    effects,
+                } => Ability::Triggered {
+                    when,
+                    only_if,
                     effects: effects.leak(),
                 },
             })
@@ -310,6 +320,7 @@ mod tests {
             effects: vec![],
             abilities: vec![AbilitySpec::Triggered {
                 when: Trigger::Enters,
+                only_if: None,
                 effects: vec![Effect::Draw {
                     who: Who::You,
                     count: 1,
@@ -356,6 +367,7 @@ mod tests {
         let mut targeted = creature("test-sniper");
         targeted.abilities = vec![AbilitySpec::Triggered {
             when: Trigger::Enters,
+            only_if: None,
             effects: vec![Effect::Damage {
                 amount: 1,
                 target: TargetKind::Any,
@@ -396,6 +408,45 @@ mod tests {
         assert!(
             pool.card("test-fine").is_none(),
             "nothing from a bad pack is added"
+        );
+    }
+
+    #[test]
+    fn that_player_needs_a_trigger_with_a_player() {
+        let lose = |who| Effect::LoseGame { who };
+        let mut on_enter = creature("test-curse");
+        on_enter.abilities = vec![AbilitySpec::Triggered {
+            when: Trigger::Enters,
+            only_if: None,
+            effects: vec![lose(Who::ThatPlayer)],
+        }];
+        let mut on_hit = creature("test-reaver");
+        on_hit.abilities = vec![AbilitySpec::Triggered {
+            when: Trigger::DealsCombatDamageToPlayer,
+            only_if: None,
+            effects: vec![lose(Who::ThatPlayer)],
+        }];
+        let spell = CardSpec {
+            kind: SpecKind::Sorcery,
+            power: None,
+            toughness: None,
+            keywords: vec![],
+            effects: vec![lose(Who::ThatPlayer)],
+            abilities: vec![],
+            ..creature("test-hex")
+        };
+        let pack = Pack {
+            cards: vec![on_enter, on_hit, spell],
+            decks: vec![],
+        };
+        let PackError(problems) = CardPool::builtin().add_pack(pack).unwrap_err();
+        assert_eq!(
+            problems,
+            [
+                "card \"test-curse\": ability 1 uses \"that_player\", but its trigger doesn't \
+                 involve a player",
+                "card \"test-hex\": \"that_player\" only works in an ability triggered by a player",
+            ]
         );
     }
 }
